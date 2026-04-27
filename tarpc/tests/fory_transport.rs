@@ -1,9 +1,3 @@
-// Copyright 2018 Google LLC
-//
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file or at
-// https://opensource.org/licenses/MIT.
-
 //! End-to-end tests for `serde_transport::fory` over TCP.
 //!
 //! Uses `String` as both request and response type. The envelope wrapper types

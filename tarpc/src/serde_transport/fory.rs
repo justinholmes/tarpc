@@ -1,9 +1,3 @@
-// Copyright 2018 Google LLC
-//
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file or at
-// https://opensource.org/licenses/MIT.
-
 //! TCP transport using Apache Fory codec.
 //!
 //! Mirrors [`crate::serde_transport::tcp`] but serializes tarpc envelope types

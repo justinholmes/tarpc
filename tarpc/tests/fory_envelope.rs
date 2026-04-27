@@ -1,9 +1,3 @@
-// Copyright 2018 Google LLC
-//
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file or at
-// https://opensource.org/licenses/MIT.
-
 //! Round-trip tests for fory-serializable tarpc envelope types.
 //!
 //! These tests verify that `ForyClientMessage`, `ForyRequest`, `ForyResponse`,

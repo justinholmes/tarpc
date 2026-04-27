@@ -1,9 +1,3 @@
-// Copyright 2018 Google LLC
-//
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file or at
-// https://opensource.org/licenses/MIT.
-
 //! Canonical proof: `#[tarpc::service]` over real fory TCP.
 //!
 //! This test is the deliverable for the TYPE_ID_COUNTER bypass. It proves that:
