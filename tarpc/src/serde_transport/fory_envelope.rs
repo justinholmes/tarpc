@@ -16,6 +16,19 @@
 //! for the round-trip path the transport actually uses. Schema drift is
 //! caught by the codec parity test (Task 3.5).
 //!
+//! ## Registration
+//!
+//! These types use manual `Serializer` implementations and must be registered
+//! via `fory.register_serializer::<T>(id)` (NOT `fory.register::<T>(id)`).
+//! Use [`register_envelope_types`] to register all envelope types at once.
+//!
+//! Using `register_serializer` instead of `register` sidesteps the fory-derive
+//! compile-time `TYPE_ID_COUNTER` collision: `register` requires `StructSerializer`
+//! which calls `fory_type_index()` — a per-crate counter that resets to 0 for
+//! every compilation unit. `register_serializer` uses the `EXT` type path which
+//! never consults `fory_type_index()`, so user-defined types (also starting at
+//! index 0 in their crate) can coexist in the same `Fory` instance.
+//!
 //! ## `io::ErrorKind` wire encoding
 //!
 //! The u32 discriminants match tarpc's own serde encoding in `util/serde.rs`:
@@ -50,10 +63,12 @@
 //! A value of 0 means "already expired or no deadline". The receiver reconstructs
 //! `Instant::now() + Duration::from_nanos(remaining_ns)`.
 
+use std::any::Any;
 use std::io;
 use std::time::{Duration, Instant};
 
-use fory::{ForyDefault, ForyObject, Serializer};
+use fory::{Error, ForyDefault, ReadContext, Serializer, TypeResolver, WriteContext};
+use fory_core::types::RefMode;
 
 use crate::{ClientMessage, Request, Response, ServerError, context, trace};
 
@@ -62,7 +77,7 @@ use crate::{ClientMessage, Request, Response, ServerError, context, trace};
 // ---------------------------------------------------------------------------
 
 /// Fory-serializable mirror of `trace::Context`.
-#[derive(Debug, Clone, ForyObject)]
+#[derive(Debug, Clone)]
 pub struct ForyTraceContext {
     /// Raw u128 bits of the `TraceId`.
     pub trace_id: u128,
@@ -72,10 +87,43 @@ pub struct ForyTraceContext {
     pub sampling: u8,
 }
 
+impl ForyDefault for ForyTraceContext {
+    fn fory_default() -> Self {
+        ForyTraceContext { trace_id: 0, span_id: 0, sampling: 0 }
+    }
+}
+
+impl Serializer for ForyTraceContext {
+    fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
+        self.trace_id.fory_write(context, RefMode::None, false, false)?;
+        self.span_id.fory_write(context, RefMode::None, false, false)?;
+        self.sampling.fory_write(context, RefMode::None, false, false)?;
+        Ok(())
+    }
+
+    fn fory_read_data(context: &mut ReadContext) -> Result<Self, Error>
+    where
+        Self: Sized + ForyDefault,
+    {
+        let trace_id = u128::fory_read(context, RefMode::None, false)?;
+        let span_id = u64::fory_read(context, RefMode::None, false)?;
+        let sampling = u8::fory_read(context, RefMode::None, false)?;
+        Ok(ForyTraceContext { trace_id, span_id, sampling })
+    }
+
+    fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
+        Self::fory_get_type_id(type_resolver)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Fory-serializable mirror of `ServerError`.
 ///
 /// `kind` is encoded as a u32 per the table in the module-level docs.
-#[derive(Debug, Clone, ForyObject)]
+#[derive(Debug, Clone)]
 pub struct ForyServerError {
     /// io::ErrorKind discriminant value (see module docs for mapping).
     pub kind: u32,
@@ -83,11 +131,44 @@ pub struct ForyServerError {
     pub detail: String,
 }
 
+impl ForyDefault for ForyServerError {
+    fn fory_default() -> Self {
+        ForyServerError { kind: 0, detail: String::new() }
+    }
+}
+
+impl Serializer for ForyServerError {
+    fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
+        self.kind.fory_write(context, RefMode::None, false, false)?;
+        self.detail.fory_write(context, RefMode::None, false, false)?;
+        Ok(())
+    }
+
+    fn fory_read_data(context: &mut ReadContext) -> Result<Self, Error>
+    where
+        Self: Sized + ForyDefault,
+    {
+        let kind = u32::fory_read(context, RefMode::None, false)?;
+        let detail = String::fory_read(context, RefMode::None, false)?;
+        Ok(ForyServerError { kind, detail })
+    }
+
+    fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
+        Self::fory_get_type_id(type_resolver)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Fory-serializable analog of `Result<T, ServerError>`.
 ///
 /// fory-core 0.17 has no `Serializer` impl for `std::result::Result`, so we
 /// define a dedicated two-variant enum.
-#[derive(Debug, Clone, ForyObject)]
+///
+/// Wire encoding: u8 discriminant (0 = Ok, 1 = Err) followed by the payload.
+#[derive(Debug, Clone)]
 pub enum ForyResult<T: Serializer + ForyDefault + 'static> {
     /// Successful response payload.
     Ok(T),
@@ -95,11 +176,62 @@ pub enum ForyResult<T: Serializer + ForyDefault + 'static> {
     Err(ForyServerError),
 }
 
+impl<T: Serializer + ForyDefault + 'static> ForyDefault for ForyResult<T> {
+    fn fory_default() -> Self {
+        ForyResult::Ok(T::fory_default())
+    }
+}
+
+impl<T: Serializer + ForyDefault + 'static> Serializer for ForyResult<T> {
+    fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
+        match self {
+            ForyResult::Ok(v) => {
+                context.writer.write_u8(0);
+                v.fory_write(context, RefMode::None, false, false)?;
+            }
+            ForyResult::Err(e) => {
+                context.writer.write_u8(1);
+                e.fory_write(context, RefMode::None, false, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fory_read_data(context: &mut ReadContext) -> Result<Self, Error>
+    where
+        Self: Sized + ForyDefault,
+    {
+        let discriminant = context.reader.read_u8()?;
+        match discriminant {
+            0 => {
+                let v = T::fory_read(context, RefMode::None, false)?;
+                Ok(ForyResult::Ok(v))
+            }
+            1 => {
+                let e = ForyServerError::fory_read(context, RefMode::None, false)?;
+                Ok(ForyResult::Err(e))
+            }
+            _ => Err(Error::invalid_data(format!(
+                "ForyResult: unknown discriminant {}",
+                discriminant
+            ))),
+        }
+    }
+
+    fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
+        Self::fory_get_type_id(type_resolver)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Fory-serializable mirror of `Request<T>`.
 ///
 /// `context::Context.deadline` (an `Instant`) is replaced by `deadline_ns`:
 /// nanoseconds remaining from the point of serialization. See module docs.
-#[derive(Debug, Clone, ForyObject)]
+#[derive(Debug, Clone)]
 pub struct ForyRequest<T: Serializer + ForyDefault + 'static> {
     /// Request ID — unique within a single channel.
     pub id: u64,
@@ -111,8 +243,48 @@ pub struct ForyRequest<T: Serializer + ForyDefault + 'static> {
     pub message: T,
 }
 
+impl<T: Serializer + ForyDefault + 'static> ForyDefault for ForyRequest<T> {
+    fn fory_default() -> Self {
+        ForyRequest {
+            id: 0,
+            trace: ForyTraceContext::fory_default(),
+            deadline_ns: 0,
+            message: T::fory_default(),
+        }
+    }
+}
+
+impl<T: Serializer + ForyDefault + 'static> Serializer for ForyRequest<T> {
+    fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
+        self.id.fory_write(context, RefMode::None, false, false)?;
+        self.trace.fory_write(context, RefMode::None, false, false)?;
+        self.deadline_ns.fory_write(context, RefMode::None, false, false)?;
+        self.message.fory_write(context, RefMode::None, false, false)?;
+        Ok(())
+    }
+
+    fn fory_read_data(context: &mut ReadContext) -> Result<Self, Error>
+    where
+        Self: Sized + ForyDefault,
+    {
+        let id = u64::fory_read(context, RefMode::None, false)?;
+        let trace = ForyTraceContext::fory_read(context, RefMode::None, false)?;
+        let deadline_ns = u64::fory_read(context, RefMode::None, false)?;
+        let message = T::fory_read(context, RefMode::None, false)?;
+        Ok(ForyRequest { id, trace, deadline_ns, message })
+    }
+
+    fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
+        Self::fory_get_type_id(type_resolver)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Fory-serializable mirror of `Response<T>`.
-#[derive(Debug, Clone, ForyObject)]
+#[derive(Debug, Clone)]
 pub struct ForyResponse<T: Serializer + ForyDefault + 'static> {
     /// ID of the request this is responding to.
     pub request_id: u64,
@@ -120,8 +292,44 @@ pub struct ForyResponse<T: Serializer + ForyDefault + 'static> {
     pub message: ForyResult<T>,
 }
 
+impl<T: Serializer + ForyDefault + 'static> ForyDefault for ForyResponse<T> {
+    fn fory_default() -> Self {
+        ForyResponse {
+            request_id: 0,
+            message: ForyResult::fory_default(),
+        }
+    }
+}
+
+impl<T: Serializer + ForyDefault + 'static> Serializer for ForyResponse<T> {
+    fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
+        self.request_id.fory_write(context, RefMode::None, false, false)?;
+        self.message.fory_write(context, RefMode::None, false, false)?;
+        Ok(())
+    }
+
+    fn fory_read_data(context: &mut ReadContext) -> Result<Self, Error>
+    where
+        Self: Sized + ForyDefault,
+    {
+        let request_id = u64::fory_read(context, RefMode::None, false)?;
+        let message = ForyResult::<T>::fory_read(context, RefMode::None, false)?;
+        Ok(ForyResponse { request_id, message })
+    }
+
+    fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
+        Self::fory_get_type_id(type_resolver)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Fory-serializable mirror of `ClientMessage<T>`.
-#[derive(Debug, Clone, ForyObject)]
+///
+/// Wire encoding: u8 discriminant (0 = Request, 1 = Cancel) followed by payload.
+#[derive(Debug, Clone)]
 pub enum ForyClientMessage<T: Serializer + ForyDefault + 'static> {
     /// A new request from the client.
     Request(ForyRequest<T>),
@@ -132,6 +340,99 @@ pub enum ForyClientMessage<T: Serializer + ForyDefault + 'static> {
         /// ID of the request to cancel.
         request_id: u64,
     },
+}
+
+impl<T: Serializer + ForyDefault + 'static> ForyDefault for ForyClientMessage<T> {
+    fn fory_default() -> Self {
+        ForyClientMessage::Request(ForyRequest::fory_default())
+    }
+}
+
+impl<T: Serializer + ForyDefault + 'static> Serializer for ForyClientMessage<T> {
+    fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
+        match self {
+            ForyClientMessage::Request(req) => {
+                context.writer.write_u8(0);
+                req.fory_write(context, RefMode::None, false, false)?;
+            }
+            ForyClientMessage::Cancel { trace, request_id } => {
+                context.writer.write_u8(1);
+                trace.fory_write(context, RefMode::None, false, false)?;
+                request_id.fory_write(context, RefMode::None, false, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fory_read_data(context: &mut ReadContext) -> Result<Self, Error>
+    where
+        Self: Sized + ForyDefault,
+    {
+        let discriminant = context.reader.read_u8()?;
+        match discriminant {
+            0 => {
+                let req = ForyRequest::<T>::fory_read(context, RefMode::None, false)?;
+                Ok(ForyClientMessage::Request(req))
+            }
+            1 => {
+                let trace = ForyTraceContext::fory_read(context, RefMode::None, false)?;
+                let request_id = u64::fory_read(context, RefMode::None, false)?;
+                Ok(ForyClientMessage::Cancel { trace, request_id })
+            }
+            _ => Err(Error::invalid_data(format!(
+                "ForyClientMessage: unknown discriminant {}",
+                discriminant
+            ))),
+        }
+    }
+
+    fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
+        Self::fory_get_type_id(type_resolver)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registration helper
+// ---------------------------------------------------------------------------
+
+/// Register all envelope wrapper types in a `Fory` instance.
+///
+/// This uses `register_serializer` (EXT type path) rather than `register`
+/// (STRUCT type path), which avoids the fory-derive `TYPE_ID_COUNTER` collision
+/// between independently compiled crates. See the module-level documentation.
+///
+/// `T` is the user's request/response type. Call this helper once per `T`:
+///
+/// ```rust,ignore
+/// let mut fory = Fory::default();
+/// register_envelope_types::<HelloRequest>(&mut fory).unwrap();
+/// register_envelope_types::<HelloResponse>(&mut fory).unwrap();
+/// fory.register_serializer::<HelloRequest>(100).unwrap();
+/// fory.register_serializer::<HelloResponse>(101).unwrap();
+/// ```
+///
+/// The IDs 2–7 are reserved for the tarpc envelope types. User types must
+/// use IDs >= 100 (or any value that does not conflict).
+///
+/// Note: if the server sends `ForyClientMessage<Req>` and `ForyResponse<Resp>`,
+/// you need to call this for both `Req` and `Resp` when both are user-defined
+/// types. If using built-in types like `String` or `u32`, only call it for the
+/// user-defined type (built-ins are pre-registered).
+pub fn register_envelope_types<T>(fory: &mut fory::Fory) -> Result<(), fory::Error>
+where
+    T: Serializer + ForyDefault + Send + 'static,
+{
+    fory.register_serializer::<ForyTraceContext>(2)?;
+    fory.register_serializer::<ForyServerError>(3)?;
+    fory.register_serializer::<ForyResult<T>>(4)?;
+    fory.register_serializer::<ForyRequest<T>>(5)?;
+    fory.register_serializer::<ForyResponse<T>>(6)?;
+    fory.register_serializer::<ForyClientMessage<T>>(7)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

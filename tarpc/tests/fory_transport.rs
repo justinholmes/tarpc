@@ -6,10 +6,9 @@
 
 //! End-to-end tests for `serde_transport::fory` over TCP.
 //!
-//! Uses `String` as both request and response type because built-in types
-//! are registered by fory internally and do not need explicit `register`
-//! calls, avoiding type-index collisions between the test crate and the tarpc
-//! lib crate. See the `fory_envelope` test for a detailed explanation.
+//! Uses `String` as both request and response type. The envelope wrapper types
+//! use manual `Serializer` impls and must be registered via `register_serializer`
+//! (EXT type path). Use the `register_envelope_types` helper for convenience.
 
 #![cfg(all(feature = "serde-transport-fory", feature = "tcp"))]
 
@@ -23,24 +22,20 @@ use tarpc::{
     serde_transport::fory as fory_transport,
     serde_transport::fory_envelope::{
         ForyClientMessage, ForyRequest, ForyResponse, ForyResult, ForyServerError, ForyTraceContext,
+        register_envelope_types,
     },
 };
 
 // ---------------------------------------------------------------------------
 // Helper: build a shared Fory registry with all envelope types registered.
 //
-// We use String as Req and Resp throughout, so only the envelope wrapper types
-// need explicit registration (builtin String is registered internally).
+// We use String as Req and Resp throughout. Envelope types use manual
+// Serializer impls registered via register_serializer (EXT type path).
 // ---------------------------------------------------------------------------
 
 fn make_fory() -> Arc<Fory> {
     let mut fory = Fory::default();
-    fory.register::<ForyTraceContext>(2).unwrap();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<String>>(4).unwrap();
-    fory.register::<ForyRequest<String>>(5).unwrap();
-    fory.register::<ForyResponse<String>>(6).unwrap();
-    fory.register::<ForyClientMessage<String>>(7).unwrap();
+    register_envelope_types::<String>(&mut fory).unwrap();
     Arc::new(fory)
 }
 

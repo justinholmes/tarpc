@@ -11,49 +11,38 @@
 //! without data loss. They also exercise the `From`/`Into` conversions between
 //! the fory wrapper types and tarpc's native envelope types.
 //!
-//! ## Why primitive generics?
+//! ## Registration
 //!
-//! The `ForyObject` derive macro assigns a compile-time type index starting from 0
-//! for each crate. Registering a user-defined `Body` type (index 0 in the test crate)
-//! alongside `ForyTraceContext` (also index 0 in the tarpc lib crate) in the same
-//! `TypeResolver` would collide. We avoid this by using builtin primitive types like
-//! `u32` or `String` as the generic parameter `T`, because builtin types are registered
-//! through `register_internal_serializer` and do not occupy the compile-time index table.
-//! Native ↔ wrapper conversion tests use `u32` for the same reason.
+//! The envelope types now use manual `Serializer` impls and must be registered via
+//! `register_serializer` (the EXT type path) rather than `register` (the STRUCT path).
+//! Use the `register_envelope_types` helper, or call `fory.register_serializer::<T>(id)`.
+//! This sidesteps the fory-derive `TYPE_ID_COUNTER` collision, so user-defined types
+//! can now be registered alongside the envelope types in the same `Fory` instance.
 
 #![cfg(feature = "serde-transport-fory")]
 
 use fory::Fory;
 use tarpc::serde_transport::fory_envelope::{
     ForyClientMessage, ForyRequest, ForyResponse, ForyResult, ForyServerError, ForyTraceContext,
+    register_envelope_types,
 };
 
 // ---------------------------------------------------------------------------
 // Helper: build a Fory instance with the envelope types registered.
 //
-// We use u32 as the generic parameter for all envelope types to avoid
-// compile-time type-index collisions between the test crate and the tarpc lib.
+// Envelope types now use manual Serializer impls and must be registered via
+// register_serializer (EXT type path), not register (STRUCT type path).
 // ---------------------------------------------------------------------------
 
 fn make_fory_u32() -> Fory {
     let mut fory = Fory::default();
-    fory.register::<ForyTraceContext>(2).unwrap();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<u32>>(4).unwrap();
-    fory.register::<ForyRequest<u32>>(5).unwrap();
-    fory.register::<ForyResponse<u32>>(6).unwrap();
-    fory.register::<ForyClientMessage<u32>>(7).unwrap();
+    register_envelope_types::<u32>(&mut fory).unwrap();
     fory
 }
 
 fn make_fory_string() -> Fory {
     let mut fory = Fory::default();
-    fory.register::<ForyTraceContext>(2).unwrap();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<String>>(4).unwrap();
-    fory.register::<ForyRequest<String>>(5).unwrap();
-    fory.register::<ForyResponse<String>>(6).unwrap();
-    fory.register::<ForyClientMessage<String>>(7).unwrap();
+    register_envelope_types::<String>(&mut fory).unwrap();
     fory
 }
 
@@ -64,7 +53,7 @@ fn make_fory_string() -> Fory {
 #[test]
 fn fory_trace_context_round_trip() {
     let mut fory = Fory::default();
-    fory.register::<ForyTraceContext>(2).unwrap();
+    fory.register_serializer::<ForyTraceContext>(2).unwrap();
 
     let original = ForyTraceContext {
         trace_id: 0xDEAD_BEEF_CAFE_BABE_0102_0304_0506_0708_u128,
@@ -81,7 +70,7 @@ fn fory_trace_context_round_trip() {
 #[test]
 fn fory_server_error_round_trip() {
     let mut fory = Fory::default();
-    fory.register::<ForyServerError>(3).unwrap();
+    fory.register_serializer::<ForyServerError>(3).unwrap();
 
     let original = ForyServerError {
         kind: 13, // TimedOut
@@ -96,8 +85,8 @@ fn fory_server_error_round_trip() {
 #[test]
 fn fory_result_ok_round_trip() {
     let mut fory = Fory::default();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<u32>>(4).unwrap();
+    fory.register_serializer::<ForyServerError>(3).unwrap();
+    fory.register_serializer::<ForyResult<u32>>(4).unwrap();
 
     let original: ForyResult<u32> = ForyResult::Ok(42u32);
     let bytes = fory.serialize(&original).unwrap();
@@ -111,8 +100,8 @@ fn fory_result_ok_round_trip() {
 #[test]
 fn fory_result_err_round_trip() {
     let mut fory = Fory::default();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<u32>>(4).unwrap();
+    fory.register_serializer::<ForyServerError>(3).unwrap();
+    fory.register_serializer::<ForyResult<u32>>(4).unwrap();
 
     let original: ForyResult<u32> = ForyResult::Err(ForyServerError {
         kind: 0, // NotFound

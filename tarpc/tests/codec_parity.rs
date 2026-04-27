@@ -12,15 +12,11 @@
 //! and asserts that `native_msg' ≈ native_msg` (modulo intentionally lossy
 //! conversions, e.g. `Instant → relative nanos → re-anchored Instant`).
 //!
-//! ## Why no custom `Body` struct?
+//! ## Registration
 //!
-//! The `ForyObject` derive macro assigns a compile-time type index starting
-//! from 0 for each crate.  Registering a user-defined `Body` type (index 0 in
-//! the test crate) alongside `ForyTraceContext` (also index 0 in the tarpc lib
-//! crate) in the same `TypeResolver` would collide.  We avoid this by using
-//! builtin primitive types (`u32`, `String`) as the generic parameter `T`,
-//! because builtin types are registered through `register_internal_serializer`
-//! and do not occupy the compile-time index table.
+//! The envelope types use manual `Serializer` impls and must be registered via
+//! `register_serializer` (the EXT type path). This sidesteps the fory-derive
+//! `TYPE_ID_COUNTER` collision between independently compiled crates.
 
 #![cfg(feature = "serde-transport-fory")]
 
@@ -29,6 +25,7 @@ use std::time::{Duration, Instant};
 use tarpc::context;
 use tarpc::serde_transport::fory_envelope::{
     ForyClientMessage, ForyRequest, ForyResponse, ForyResult, ForyServerError, ForyTraceContext,
+    register_envelope_types,
 };
 use tarpc::trace::{self, SamplingDecision, SpanId, TraceId};
 use tarpc::{ClientMessage, Request, Response, ServerError};
@@ -39,23 +36,13 @@ use tarpc::{ClientMessage, Request, Response, ServerError};
 
 fn build_fory_u32() -> Fory {
     let mut fory = Fory::default();
-    fory.register::<ForyTraceContext>(2).unwrap();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<u32>>(4).unwrap();
-    fory.register::<ForyRequest<u32>>(5).unwrap();
-    fory.register::<ForyResponse<u32>>(6).unwrap();
-    fory.register::<ForyClientMessage<u32>>(7).unwrap();
+    register_envelope_types::<u32>(&mut fory).unwrap();
     fory
 }
 
 fn build_fory_string() -> Fory {
     let mut fory = Fory::default();
-    fory.register::<ForyTraceContext>(2).unwrap();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<String>>(4).unwrap();
-    fory.register::<ForyRequest<String>>(5).unwrap();
-    fory.register::<ForyResponse<String>>(6).unwrap();
-    fory.register::<ForyClientMessage<String>>(7).unwrap();
+    register_envelope_types::<String>(&mut fory).unwrap();
     fory
 }
 

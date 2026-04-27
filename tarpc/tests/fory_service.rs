@@ -4,50 +4,26 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT.
 
-//! End-to-end test: `#[tarpc::service]`-generated types derive `ForyObject`.
+//! Canonical proof: `#[tarpc::service]` over real fory TCP.
 //!
-//! This test file is the canonical proof that the proc-macro patch works.
+//! This test is the deliverable for the TYPE_ID_COUNTER bypass. It proves that:
 //!
-//! ## What the patch does
+//! 1. `#[tarpc::service]`-generated types (`HelloRequest`, `HelloResponse`) derive
+//!    `ForyObject` via the proc-macro patch and can be registered in a `Fory` instance.
+//! 2. Tarpc envelope types (`ForyTraceContext`, etc.) use manual `Serializer` impls
+//!    and are registered via `register_serializer` (EXT type path).
+//! 3. Both can coexist in the same `Fory` instance without "Type index N already
+//!    registered" collision — because `register_serializer` never touches the
+//!    `type_id_index` Vec that `register` writes via `fory_type_index()`.
+//! 4. A full `#[tarpc::service]` call round-trip works over a real fory TCP transport.
 //!
-//! `plugins/src/lib.rs` now emits the following attribute on both the generated
-//! request enum and the generated response enum:
+//! ## Why the collision is gone
 //!
-//! ```text
-//! #[cfg_attr(feature = "fory", derive(::fory::ForyObject))]
-//! ```
-//!
-//! When the user's crate has `feature = "fory"` active (which it does here via
-//! `serde-transport-fory → fory`), the generated `HelloRequest` and
-//! `HelloResponse` types automatically implement `fory::Serializer` and
-//! `fory::ForyDefault`.
-//!
-//! ## Tests
-//!
-//! 1. **`generated_types_satisfy_fory_bounds`** — in-memory fory serialization
-//!    round-trip for `HelloRequest` and `HelloResponse` in isolation, using a
-//!    fresh `Fory` registry (no envelope types).  Proves the derive is
-//!    functionally correct and the types can be serialized/deserialized.
-//!
-//! 2. **`hello_service_over_fory_tcp`** — full `#[tarpc::service]` pipeline
-//!    over the fory TCP transport, using the proc-macro-generated client and
-//!    server stubs.  Because of a fory 0.17 limitation (compile-time type
-//!    indices start at 0 per crate compilation and can collide between
-//!    independent compilation units), the generated request/response types
-//!    cannot share a `Fory` registry with the tarpc envelope types
-//!    (`ForyTraceContext` etc.) without colliding at type index 0.
-//!    The test therefore uses `String` as the wire payload type — which fory
-//!    handles as a built-in type without occupying a compile-time index slot —
-//!    while exercising the full tarpc service machinery via an in-memory
-//!    channel transport for the `Hello` service.
-//!
-//! ## Type bounds verification (compile-time)
-//!
-//! The `fory_transport::connect::<_, HelloRequest, HelloResponse>` call at the
-//! bottom of `hello_service_over_fory_tcp` will only compile if `HelloRequest`
-//! and `HelloResponse` satisfy `fory::Serializer + fory::ForyDefault + Clone`.
-//! If the derive patch is missing or incorrect, this call will fail to
-//! compile — making this file itself a compile-time regression test.
+//! - `register::<HelloRequest>(100)` writes to `type_id_index[HelloRequest::fory_type_index()]`
+//!   (index 0 in this test binary's crate).
+//! - `register_serializer::<ForyTraceContext>(2)` writes to `user_type_info_by_id[2]`
+//!   and never touches `type_id_index`.
+//! - Two different data structures → no collision.
 
 #![cfg(all(feature = "serde-transport-fory", feature = "tcp"))]
 
@@ -57,20 +33,19 @@ use std::sync::Arc;
 use tarpc::{
     client, context,
     server::{self, Channel},
+    server::incoming::Incoming as _,
     serde_transport::fory as fory_transport,
     serde_transport::fory_envelope::{
         ForyClientMessage, ForyRequest, ForyResponse, ForyResult, ForyServerError, ForyTraceContext,
+        register_envelope_types,
     },
 };
 
 // ---------------------------------------------------------------------------
 // Service definition
 //
-// `derive = [Clone, serde::Serialize, serde::Deserialize]` adds Clone (needed
-// by the fory transport codec bounds) and serde derives (needed by the
-// serde_transport machinery).  The `ForyObject` derive is added automatically
-// by the proc-macro via `#[cfg_attr(feature = "fory", derive(::fory::ForyObject))]`
-// because the `fory` feature is active.
+// The proc-macro emits `#[cfg_attr(feature = "fory", derive(::fory::ForyObject))]`
+// on both HelloRequest and HelloResponse, so they implement Serializer + ForyDefault.
 // ---------------------------------------------------------------------------
 
 #[tarpc::service(derive = [Clone, serde::Serialize, serde::Deserialize])]
@@ -88,30 +63,105 @@ impl Hello for HelloServer {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: In-memory fory serialization of generated types.
+// Helper: build Fory registry with both envelope types and user types.
 //
-// Proves that `HelloRequest` and `HelloResponse` implement `ForyObject` and
-// can be serialized/deserialized correctly.  Uses a fresh Fory registry with
-// no envelope types to avoid the fory 0.17 type-index collision between
-// independently compiled crates.
+// This is the registration that was previously IMPOSSIBLE due to the
+// TYPE_ID_COUNTER collision. Now it works.
+//
+// We use register_envelope_types::<HelloRequest> for the request-side types,
+// and manually register the response-side types with different IDs to avoid
+// conflicts when Req != Resp. IDs 2-7 are for the Req-parameterized types;
+// IDs 8-9 are for the Resp-only types (ForyResult<Resp>, ForyResponse<Resp>).
+// ---------------------------------------------------------------------------
+
+fn make_fory() -> Arc<Fory> {
+    let mut fory = Fory::default();
+
+    // Non-generic envelope types (shared by Req and Resp sides).
+    fory.register_serializer::<ForyTraceContext>(2).unwrap();
+    fory.register_serializer::<ForyServerError>(3).unwrap();
+
+    // Request-side generic types (parameterized by HelloRequest).
+    fory.register_serializer::<ForyResult<HelloRequest>>(4).unwrap();
+    fory.register_serializer::<ForyRequest<HelloRequest>>(5).unwrap();
+    fory.register_serializer::<ForyClientMessage<HelloRequest>>(7).unwrap();
+
+    // Response-side generic types (parameterized by HelloResponse).
+    // Use IDs 8-9 to avoid collision with the request-side IDs 4 and 6.
+    fory.register_serializer::<ForyResult<HelloResponse>>(8).unwrap();
+    fory.register_serializer::<ForyResponse<HelloResponse>>(6).unwrap();
+
+    // Register user types via register (STRUCT path — uses fory_type_index).
+    // HelloRequest is the first ForyObject in this test binary → index 0.
+    // HelloResponse is the second → index 1.
+    // Envelope types registered above do NOT occupy index 0 or 1 — no collision.
+    fory.register::<HelloRequest>(100).unwrap();
+    fory.register::<HelloResponse>(101).unwrap();
+
+    Arc::new(fory)
+}
+
+// ---------------------------------------------------------------------------
+// THE CANONICAL PROOF: #[tarpc::service] over real fory TCP
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hello_service_over_fory_tcp_real() {
+    let fory = make_fory();
+
+    // Server: listen on an ephemeral port.
+    let mut listener =
+        fory_transport::listen::<_, HelloRequest, HelloResponse>("127.0.0.1:0", fory.clone())
+            .await
+            .unwrap();
+    let addr = listener.local_addr();
+
+    tokio::spawn(async move {
+        while let Some(Ok(transport)) = listener.next().await {
+            let channel = server::BaseChannel::with_defaults(transport);
+            tokio::spawn(
+                channel
+                    .execute(HelloServer.serve())
+                    .for_each(|fut| async move {
+                        tokio::spawn(fut);
+                    }),
+            );
+        }
+    });
+
+    // Client: connect, call, assert.
+    let transport =
+        fory_transport::connect::<_, HelloRequest, HelloResponse>(addr, fory)
+            .await
+            .unwrap();
+    let client = HelloClient::new(client::Config::default(), transport).spawn();
+
+    let resp = client
+        .hello(context::current(), "world".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(resp, "hello, world");
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: In-memory serialization of generated types (regression guard)
+//
+// Verifies that HelloRequest and HelloResponse implement ForyObject correctly
+// in isolation.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn generated_types_satisfy_fory_bounds() {
     let mut fory = Fory::default();
-    // HelloRequest is the first ForyObject type in this test binary → index 0.
-    // HelloResponse is the second → index 1.
-    // Register them with explicit wire IDs that don't conflict with each other.
     fory.register::<HelloRequest>(10).unwrap();
     fory.register::<HelloResponse>(11).unwrap();
 
-    // HelloRequest has a single variant Hello { name: String }.
     let req = HelloRequest::Hello { name: "world".to_string() };
     let bytes = fory.serialize(&req).unwrap();
     let decoded: HelloRequest = fory.deserialize(&bytes).unwrap();
     assert!(matches!(decoded, HelloRequest::Hello { name } if name == "world"));
 
-    // HelloResponse has a single variant Hello(String).
     let resp = HelloResponse::Hello("hello, world".to_string());
     let bytes = fory.serialize(&resp).unwrap();
     let decoded: HelloResponse = fory.deserialize(&bytes).unwrap();
@@ -119,64 +169,24 @@ fn generated_types_satisfy_fory_bounds() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: Full service round-trip.
+// Test 3: Envelope + user types in same registry (the collision test)
 //
-// Drives the Hello service using tarpc's in-memory channel transport.
-// This validates that the proc-macro-generated client/server stubs work
-// correctly end-to-end.
-//
-// The transport compile-time bound check below ensures the generated types
-// also satisfy the fory transport bounds, making the full fory TCP path
-// available to users with properly constructed registries.
+// Proves register_envelope_types and register::<HelloXxx> can coexist.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn hello_service_over_fory_tcp() {
-    // --- In-memory service round-trip ---
-    let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-
-    tokio::spawn(async move {
-        server::BaseChannel::with_defaults(server_transport)
-            .execute(HelloServer.serve())
-            .for_each(|fut| async move {
-                tokio::spawn(fut);
-            })
-            .await;
-    });
-
-    let client = HelloClient::new(client::Config::default(), client_transport).spawn();
-    let resp = client
-        .hello(context::current(), "world".to_string())
-        .await
-        .unwrap();
-    assert_eq!(resp, "hello, world");
-
-    // --- Compile-time bounds check: this call proves HelloRequest and HelloResponse
-    // satisfy fory::Serializer + fory::ForyDefault + Clone + Send + 'static.
-    // It will never actually run (we return before connecting), but it must COMPILE.
-    // If the ForyObject derive is not active, this won't type-check.
-    #[allow(unreachable_code)]
-    let _ = async {
-        let _: std::io::Result<_> = {
-            let fory = make_envelope_fory();
-            // This call type-checks only if HelloRequest: fory::Serializer + ForyDefault + Clone.
-            fory_transport::connect::<_, HelloRequest, HelloResponse>("127.0.0.1:0", fory).await
-        };
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Helper: build a Fory registry with envelope types only.
-// Used solely for the compile-time bounds check above.
-// ---------------------------------------------------------------------------
-
-fn make_envelope_fory() -> Arc<Fory> {
+#[test]
+fn envelope_and_user_types_coexist_in_same_registry() {
     let mut fory = Fory::default();
-    fory.register::<ForyTraceContext>(2).unwrap();
-    fory.register::<ForyServerError>(3).unwrap();
-    fory.register::<ForyResult<String>>(4).unwrap();
-    fory.register::<ForyRequest<String>>(5).unwrap();
-    fory.register::<ForyResponse<String>>(6).unwrap();
-    fory.register::<ForyClientMessage<String>>(7).unwrap();
-    Arc::new(fory)
+    // This used to fail with "Type index 0 already registered".
+    // Now it succeeds because register_serializer and register use different
+    // internal data structures.
+    register_envelope_types::<HelloRequest>(&mut fory)
+        .expect("register_envelope_types should not fail");
+    fory.register::<HelloRequest>(100)
+        .expect("register HelloRequest should not fail");
+    // Verify both are usable.
+    let req = HelloRequest::Hello { name: "test".to_string() };
+    let bytes = fory.serialize(&req).unwrap();
+    let decoded: HelloRequest = fory.deserialize(&bytes).unwrap();
+    assert!(matches!(decoded, HelloRequest::Hello { name } if name == "test"));
 }
