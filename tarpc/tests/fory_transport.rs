@@ -53,7 +53,7 @@ async fn raw_transport_echo() {
     let fory = make_fory();
 
     let mut incoming =
-        fory_transport::listen::<_, String, String>("127.0.0.1:0", fory.clone())
+        fory_transport::listen_with_fory::<_, String, String>("127.0.0.1:0", fory.clone())
             .await
             .unwrap();
     let addr = incoming.local_addr();
@@ -75,7 +75,7 @@ async fn raw_transport_echo() {
 
     // Client: connect, send a request, receive the echo.
     let mut client_transport =
-        fory_transport::connect::<_, String, String>(addr, fory)
+        fory_transport::connect_with_fory::<_, String, String>(addr, fory)
             .await
             .unwrap();
 
@@ -158,7 +158,7 @@ async fn raw_transport_multiple_round_trips() {
     let fory = make_fory();
 
     let mut incoming =
-        fory_transport::listen::<_, String, String>("127.0.0.1:0", fory.clone())
+        fory_transport::listen_with_fory::<_, String, String>("127.0.0.1:0", fory.clone())
             .await
             .unwrap();
     let addr = incoming.local_addr();
@@ -184,7 +184,7 @@ async fn raw_transport_multiple_round_trips() {
     });
 
     let mut client_transport =
-        fory_transport::connect::<_, String, String>(addr, fory)
+        fory_transport::connect_with_fory::<_, String, String>(addr, fory)
             .await
             .unwrap();
 

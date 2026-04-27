@@ -16,11 +16,11 @@
 //! let fory = Arc::new(Fory::default());
 //!
 //! // Server side
-//! let incoming = fory_transport::listen::<_, String, String>("127.0.0.1:0", fory.clone()).await?;
+//! let incoming = fory_transport::listen_with_fory::<_, String, String>("127.0.0.1:0", fory.clone()).await?;
 //! let addr = incoming.local_addr();
 //!
 //! // Client side
-//! let transport = fory_transport::connect::<_, String, String>(addr, fory).await?;
+//! let transport = fory_transport::connect_with_fory::<_, String, String>(addr, fory).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -173,11 +173,12 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tcp")]
-pub use tcp::{Incoming, connect, listen};
+pub use tcp::{Incoming, connect, connect_with_fory, listen, listen_with_fory};
 
 #[cfg(feature = "tcp")]
 mod tcp {
     use super::*;
+    use super::super::fory_envelope::ServiceWireSchema;
     use futures::ready;
     use pin_project::pin_project;
     use std::net::SocketAddr;
@@ -185,13 +186,59 @@ mod tcp {
     use tokio_util::codec::length_delimited;
 
     // -----------------------------------------------------------------------
-    // connect
+    // connect (schema-driven — zero user-side registration)
     // -----------------------------------------------------------------------
 
     /// Connects to `addr` and returns a client-side fory transport.
     ///
-    /// The transport sinks `ClientMessage<Req>` and streams `Response<Resp>`.
-    pub async fn connect<A, Req, Resp>(
+    /// `S` is the generated marker struct (e.g. `HelloService`) that implements
+    /// [`ServiceWireSchema`]. All required types are auto-registered from
+    /// `S::register`; no manual `Fory` setup is needed.
+    pub async fn connect<S, A>(
+        addr: A,
+    ) -> io::Result<
+        Transport<TcpStream, Response<S::Resp>, ClientMessage<S::Req>, ForyEnvelopeCodec<S::Req, S::Resp>>,
+    >
+    where
+        S: ServiceWireSchema,
+        A: ToSocketAddrs,
+        S::Req: Clone,
+        // serde bounds required by Transport's Stream/Sink impls
+        ClientMessage<S::Req>: serde::Serialize,
+        Response<S::Resp>: for<'de> serde::Deserialize<'de>,
+    {
+        let mut fory_inst = fory::Fory::default();
+        S::register(&mut fory_inst).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let fory_arc = Arc::new(fory_inst);
+        connect_with_fory::<A, S::Req, S::Resp>(addr, fory_arc).await
+    }
+
+    /// Listens on `addr` and returns an [`Incoming`] stream of server-side transports.
+    ///
+    /// `S` is the generated marker struct (e.g. `HelloService`) that implements
+    /// [`ServiceWireSchema`]. All required types are auto-registered from
+    /// `S::register`; no manual `Fory` setup is needed.
+    pub async fn listen<S, A>(addr: A) -> io::Result<Incoming<S::Req, S::Resp>>
+    where
+        S: ServiceWireSchema,
+        A: ToSocketAddrs,
+    {
+        let mut fory_inst = fory::Fory::default();
+        S::register(&mut fory_inst).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let fory_arc = Arc::new(fory_inst);
+        listen_with_fory::<A, S::Req, S::Resp>(addr, fory_arc).await
+    }
+
+    // -----------------------------------------------------------------------
+    // connect_with_fory (manual Fory registry — power users)
+    // -----------------------------------------------------------------------
+
+    /// Connects to `addr` and returns a client-side fory transport.
+    ///
+    /// The caller is responsible for registering all required types in `fory`
+    /// before calling this function. Prefer [`connect`] with a `ServiceWireSchema`
+    /// type parameter for ergonomic zero-boilerplate usage.
+    pub async fn connect_with_fory<A, Req, Resp>(
         addr: A,
         fory: Arc<Fory>,
     ) -> io::Result<
@@ -213,7 +260,7 @@ mod tcp {
     }
 
     // -----------------------------------------------------------------------
-    // listen / Incoming
+    // listen_with_fory / Incoming
     // -----------------------------------------------------------------------
 
     /// A [`TcpListener`] that wraps accepted connections in fory-encoded
@@ -250,7 +297,11 @@ mod tcp {
     ///
     /// Each accepted transport sinks `Response<Resp>` and streams
     /// `ClientMessage<Req>`.
-    pub async fn listen<A, Req, Resp>(addr: A, fory: Arc<Fory>) -> io::Result<Incoming<Req, Resp>>
+    ///
+    /// The caller is responsible for registering all required types in `fory`
+    /// before calling this function. Prefer [`listen`] with a `ServiceWireSchema`
+    /// type parameter for ergonomic zero-boilerplate usage.
+    pub async fn listen_with_fory<A, Req, Resp>(addr: A, fory: Arc<Fory>) -> io::Result<Incoming<Req, Resp>>
     where
         A: ToSocketAddrs,
     {

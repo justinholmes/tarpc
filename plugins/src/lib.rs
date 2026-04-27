@@ -463,17 +463,13 @@ pub fn service(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    // Always emit a `#[cfg_attr(feature = "fory", derive(::fory::ForyObject))]` guard on the
-    // generated request/response enums.  The `cfg_attr` is evaluated at the *user's* crate
-    // compile time, not here — so the ForyObject derive (and its fory_core dependency) is only
-    // activated when the user's own crate opts into the `fory` feature.  When the feature is
-    // off, the attribute is a no-op and no fory code is pulled in.
-    //
-    // Note: this is emitted unconditionally regardless of whether the `fory` feature is active
-    // on tarpc-plugins itself; the guard lives in the generated source, not in the macro.
-    let fory_derive: TokenStream2 = quote! {
-        #[cfg_attr(feature = "fory", derive(::fory::ForyObject))]
-    };
+    // The fory feature previously emitted `#[cfg_attr(feature = "fory", derive(::fory::ForyObject))]`
+    // on generated request/response enums.  We no longer do that — instead, hand-written EXT
+    // `Serializer` impls are emitted below in `ServiceGenerator::fory_impls()`.  Using the EXT
+    // type path (rather than the STRUCT/StructSerializer path from ForyObject) avoids the
+    // `fory_type_index()` collision that arises when types from independently-compiled crates are
+    // registered in the same Fory instance.  See `fory_envelope.rs` for background.
+    let fory_derive: TokenStream2 = quote! {};
 
     let methods = rpcs.iter().map(|rpc| &rpc.ident).collect::<Vec<_>>();
     let request_names = methods
@@ -826,6 +822,313 @@ impl ServiceGenerator<'_> {
     fn emit_warnings(&self) -> TokenStream2 {
         self.warnings.iter().map(|w| w.to_token_stream()).collect()
     }
+
+    /// Emit fory EXT `Serializer` / `ForyDefault` impls for the generated request and response
+    /// enums, a `XxxService` marker struct, and a `ServiceWireSchema` impl.
+    ///
+    /// These are emitted under `#[cfg(feature = "fory")]` so they are a no-op when the fory
+    /// transport feature is not enabled.
+    ///
+    /// ## Why EXT instead of `ForyObject`
+    ///
+    /// `ForyObject` derive uses `StructSerializer::fory_type_index()`, a per-crate atomic counter
+    /// allocated at macro-expansion time.  When two crates are compiled independently, both start
+    /// at 0.  In the final binary, types from different crates can have the same `fory_type_index`,
+    /// causing "Type index N already registered" panics when both are registered in the same
+    /// `Fory` instance.
+    ///
+    /// EXT-path types (`register_serializer`, not `register`) never consult `fory_type_index`,
+    /// so they can coexist with user types from any number of crates without collision.
+    fn fory_impls(&self) -> TokenStream2 {
+        let &Self {
+            service_ident,
+            vis,
+            request_ident,
+            response_ident,
+            camel_case_idents,
+            args,
+            return_types,
+            arg_pats,
+            rpcs,
+            ..
+        } = self;
+
+        // -----------------------------------------------------------------------
+        // XxxRequest: build per-variant write/read arms.
+        //
+        // Generated enum looks like:
+        //   enum XxxRequest { MethodA { arg1: T1, arg2: T2 }, MethodB {} }
+        // Wire layout: u32 discriminant, then each field written inline.
+        // -----------------------------------------------------------------------
+
+        let mut req_write_arms = Vec::new();
+        let mut req_read_arms = Vec::new();
+
+        for (idx, ((variant, method_args), pats)) in camel_case_idents.iter()
+            .zip(args.iter())
+            .zip(arg_pats.iter())
+            .enumerate()
+        {
+            let disc = idx as u32;
+            let pat_tokens: Vec<_> = pats.iter().map(|p| quote! { #p }).collect();
+
+            // Write arm: destructure variant, write discriminant, write each field.
+            let field_writes = pats.iter().map(|pat| quote! {
+                #pat.fory_write(context, ::fory_core::types::RefMode::None, false, false)?;
+            }).collect::<Vec<_>>();
+
+            let write_pattern = if method_args.is_empty() {
+                quote! { #request_ident::#variant {} }
+            } else {
+                quote! { #request_ident::#variant { #( #pat_tokens ),* } }
+            };
+
+            req_write_arms.push(quote! {
+                #write_pattern => {
+                    (#disc as u32).fory_write(context, ::fory_core::types::RefMode::None, false, false)?;
+                    #( #field_writes )*
+                }
+            });
+
+            // Read arm: read each field, construct variant.
+            let field_reads = method_args.iter().zip(pats.iter()).map(|(arg, pat)| {
+                let ty = &arg.ty;
+                quote! {
+                    let #pat = <#ty>::fory_read(context, ::fory_core::types::RefMode::None, false)?;
+                }
+            }).collect::<Vec<_>>();
+
+            let construct = if pats.is_empty() {
+                quote! { Ok(#request_ident::#variant {}) }
+            } else {
+                quote! { Ok(#request_ident::#variant { #( #pat_tokens ),* }) }
+            };
+
+            req_read_arms.push(quote! {
+                #disc => {
+                    #( #field_reads )*
+                    #construct
+                }
+            });
+        }
+
+        // ForyDefault for XxxRequest: return first variant with all fields defaulted.
+        let req_default = {
+            let first_variant = &camel_case_idents[0];
+            let first_args: &[PatType] = args[0];
+            let first_pats: &Vec<&Pat> = &arg_pats[0];
+            if first_args.is_empty() {
+                quote! { #request_ident::#first_variant {} }
+            } else {
+                let default_fields = first_args.iter().zip(first_pats.iter()).map(|(arg, pat)| {
+                    let ty = &arg.ty;
+                    quote! { #pat: <#ty as ::fory::ForyDefault>::fory_default() }
+                }).collect::<Vec<_>>();
+                quote! { #request_ident::#first_variant { #( #default_fields ),* } }
+            }
+        };
+
+        // -----------------------------------------------------------------------
+        // XxxResponse: build per-variant write/read arms.
+        //
+        // Generated enum looks like:
+        //   enum XxxResponse { MethodA(RetType1), MethodB(RetType2) }
+        // Wire layout: u32 discriminant, then the single tuple field.
+        // -----------------------------------------------------------------------
+
+        let mut resp_write_arms = Vec::new();
+        let mut resp_read_arms = Vec::new();
+
+        for (idx, (variant, ret_ty)) in camel_case_idents.iter()
+            .zip(return_types.iter())
+            .enumerate()
+        {
+            let disc = idx as u32;
+
+            resp_write_arms.push(quote! {
+                #response_ident::#variant(__v) => {
+                    (#disc as u32).fory_write(context, ::fory_core::types::RefMode::None, false, false)?;
+                    __v.fory_write(context, ::fory_core::types::RefMode::None, false, false)?;
+                }
+            });
+
+            resp_read_arms.push(quote! {
+                #disc => {
+                    let __v = <#ret_ty>::fory_read(context, ::fory_core::types::RefMode::None, false)?;
+                    Ok(#response_ident::#variant(__v))
+                }
+            });
+        }
+
+        // ForyDefault for XxxResponse: return first variant with defaulted inner value.
+        let resp_default = {
+            let first_variant = &camel_case_idents[0];
+            let first_ret = return_types[0];
+            quote! { #response_ident::#first_variant(<#first_ret as ::fory::ForyDefault>::fory_default()) }
+        };
+
+        // -----------------------------------------------------------------------
+        // ServiceWireSchema impl
+        // -----------------------------------------------------------------------
+
+        let req_name = format!("{}Request", service_ident);
+        let resp_name = format!("{}Response", service_ident);
+        // IDs for the generated enums: FNV-1a of the module-qualified name.
+        // The module_path!() is evaluated in the user's crate at compile time.
+        let req_id_expr = quote! {
+            ::tarpc::serde_transport::fory_envelope::fory_wire_id(
+                concat!(module_path!(), "::", #req_name)
+            )
+        };
+        let resp_id_expr = quote! {
+            ::tarpc::serde_transport::fory_envelope::fory_wire_id(
+                concat!(module_path!(), "::", #resp_name)
+            )
+        };
+
+        // Collect user-type registration calls.
+        let user_type_regs = collect_user_type_registrations(rpcs);
+
+        // Marker struct: XxxService.
+        let service_marker_ident = format_ident!("{}Service", service_ident);
+
+        quote! {
+            #[cfg(feature = "fory")]
+            impl ::fory::ForyDefault for #request_ident {
+                fn fory_default() -> Self {
+                    #req_default
+                }
+            }
+
+            #[cfg(feature = "fory")]
+            impl ::fory::Serializer for #request_ident {
+                fn fory_write_data(
+                    &self,
+                    context: &mut ::fory::WriteContext,
+                ) -> ::core::result::Result<(), ::fory::Error> {
+                    match self {
+                        #( #req_write_arms )*
+                    }
+                    Ok(())
+                }
+
+                fn fory_read_data(
+                    context: &mut ::fory::ReadContext,
+                ) -> ::core::result::Result<Self, ::fory::Error>
+                where
+                    Self: Sized + ::fory::ForyDefault,
+                {
+                    let __disc = u32::fory_read(context, ::fory_core::types::RefMode::None, false)?;
+                    match __disc {
+                        #( #req_read_arms )*
+                        _ => Err(::fory::Error::invalid_data(format!(
+                            "{}: unknown variant {}",
+                            stringify!(#request_ident),
+                            __disc,
+                        ))),
+                    }
+                }
+
+                fn fory_type_id_dyn(
+                    &self,
+                    type_resolver: &::fory::TypeResolver,
+                ) -> ::core::result::Result<::fory::TypeId, ::fory::Error> {
+                    Self::fory_get_type_id(type_resolver)
+                }
+
+                fn as_any(&self) -> &dyn ::std::any::Any {
+                    self
+                }
+            }
+
+            #[cfg(feature = "fory")]
+            impl ::fory::ForyDefault for #response_ident {
+                fn fory_default() -> Self {
+                    #resp_default
+                }
+            }
+
+            #[cfg(feature = "fory")]
+            impl ::fory::Serializer for #response_ident {
+                fn fory_write_data(
+                    &self,
+                    context: &mut ::fory::WriteContext,
+                ) -> ::core::result::Result<(), ::fory::Error> {
+                    match self {
+                        #( #resp_write_arms )*
+                    }
+                    Ok(())
+                }
+
+                fn fory_read_data(
+                    context: &mut ::fory::ReadContext,
+                ) -> ::core::result::Result<Self, ::fory::Error>
+                where
+                    Self: Sized + ::fory::ForyDefault,
+                {
+                    let __disc = u32::fory_read(context, ::fory_core::types::RefMode::None, false)?;
+                    match __disc {
+                        #( #resp_read_arms )*
+                        _ => Err(::fory::Error::invalid_data(format!(
+                            "{}: unknown variant {}",
+                            stringify!(#response_ident),
+                            __disc,
+                        ))),
+                    }
+                }
+
+                fn fory_type_id_dyn(
+                    &self,
+                    type_resolver: &::fory::TypeResolver,
+                ) -> ::core::result::Result<::fory::TypeId, ::fory::Error> {
+                    Self::fory_get_type_id(type_resolver)
+                }
+
+                fn as_any(&self) -> &dyn ::std::any::Any {
+                    self
+                }
+            }
+
+            /// Marker struct for the [`#service_ident`] service.
+            ///
+            /// Pass this as the type parameter to
+            /// [`tarpc::serde_transport::fory::connect`] and
+            /// [`tarpc::serde_transport::fory::listen`] to enable zero-boilerplate
+            /// fory transport without any manual type registration.
+            #[cfg(feature = "fory")]
+            #vis struct #service_marker_ident;
+
+            #[cfg(feature = "fory")]
+            impl ::tarpc::serde_transport::fory_envelope::ServiceWireSchema for #service_marker_ident {
+                type Req = #request_ident;
+                type Resp = #response_ident;
+
+                fn register(fory: &mut ::fory::Fory) -> ::core::result::Result<(), ::fory::Error> {
+                    use ::tarpc::serde_transport::fory_envelope::{
+                        ForyTraceContext, ForyServerError,
+                        ForyResult, ForyRequest, ForyResponse, ForyClientMessage,
+                    };
+                    // Non-generic envelope types (shared across all requests/responses).
+                    fory.register_serializer::<ForyTraceContext>(2)?;
+                    fory.register_serializer::<ForyServerError>(3)?;
+                    // Request-side parameterised envelope types.
+                    fory.register_serializer::<ForyResult<#request_ident>>(4)?;
+                    fory.register_serializer::<ForyRequest<#request_ident>>(5)?;
+                    fory.register_serializer::<ForyClientMessage<#request_ident>>(7)?;
+                    // Response-side parameterised envelope types (different IDs to avoid collision).
+                    fory.register_serializer::<ForyResult<#response_ident>>(8)?;
+                    fory.register_serializer::<ForyResponse<#response_ident>>(6)?;
+                    // Generated request/response enums (EXT path — no type_id_index collision).
+                    fory.register_serializer::<#request_ident>(#req_id_expr)?;
+                    fory.register_serializer::<#response_ident>(#resp_id_expr)?;
+                    // User-defined types referenced in method signatures (STRUCT path via register).
+                    // These use fory.register() which requires ForyObject (StructSerializer).
+                    #( #user_type_regs )*
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 impl ToTokens for ServiceGenerator<'_> {
@@ -840,8 +1143,113 @@ impl ToTokens for ServiceGenerator<'_> {
             self.impl_client_new(),
             self.impl_client_rpc_methods(),
             self.emit_warnings(),
+            self.fory_impls(),
         ]);
     }
+}
+
+/// Collect registration calls for user-defined types found in method signatures.
+///
+/// We skip known built-in fory types (primitives, String, Vec, Option, etc.) and emit
+/// `fory.register::<UserType>(fory_wire_id("..."))?;` for each nominal user type found in
+/// argument or return-type positions.  Generic outer types (Vec<T>, Option<T>) are unwrapped
+/// and their type arguments are inspected recursively.
+///
+/// Note: `register` requires `StructSerializer` (from `ForyObject` derive). This is correct for
+/// user-defined types and avoids using `register_serializer` (which requires the EXT type path).
+/// The generated request/response enums use the EXT path (see `fory_impls`), so registering user
+/// types via `register` does not collide with them.
+fn collect_user_type_registrations(rpcs: &[RpcMethod]) -> Vec<TokenStream2> {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut registrations = Vec::new();
+
+    for rpc in rpcs {
+        // Collect from arguments.
+        for arg in &rpc.args {
+            collect_type_registrations(&arg.ty, &mut seen, &mut registrations);
+        }
+        // Collect from return type.
+        if let ReturnType::Type(_, ref ty) = rpc.output {
+            collect_type_registrations(ty, &mut seen, &mut registrations);
+        }
+    }
+
+    registrations
+}
+
+/// Walk a `syn::Type`, skip builtins/primitives, and for each non-trivial path type emit
+/// a `fory.register::<T>(fory_wire_id("..."))?;` call.
+fn collect_type_registrations(
+    ty: &Type,
+    seen: &mut std::collections::BTreeSet<String>,
+    out: &mut Vec<TokenStream2>,
+) {
+    match ty {
+        Type::Path(type_path) => {
+            // Get the outermost type name to classify it.
+            let last_seg = type_path.path.segments.last();
+            if let Some(seg) = last_seg {
+                let name = seg.ident.to_string();
+                if is_builtin_type_name(&name) {
+                    // Recurse into generic args (e.g., Vec<UserData> → register UserData).
+                    if let syn::PathArguments::AngleBracketed(ref args) = seg.arguments {
+                        for arg in &args.args {
+                            if let syn::GenericArgument::Type(inner_ty) = arg {
+                                collect_type_registrations(inner_ty, seen, out);
+                            }
+                        }
+                    }
+                } else {
+                    // User-defined type. Emit a register call.
+                    let path = &type_path.path;
+                    let key = quote! { #path }.to_string();
+                    if seen.insert(key) {
+                        out.push(quote! {
+                            fory.register::<#path>(
+                                ::tarpc::serde_transport::fory_envelope::fory_wire_id(
+                                    ::std::any::type_name::<#path>()
+                                )
+                            )?;
+                        });
+                    }
+                }
+            }
+        }
+        Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                collect_type_registrations(elem, seen, out);
+            }
+        }
+        // References, boxes, etc. — recurse into inner type.
+        Type::Reference(r) => collect_type_registrations(&r.elem, seen, out),
+        Type::Paren(p) => collect_type_registrations(&p.elem, seen, out),
+        Type::Group(g) => collect_type_registrations(&g.elem, seen, out),
+        // Everything else (slices, raw pointers, trait objects, etc.) — skip silently.
+        _ => {}
+    }
+}
+
+/// Returns true for type names that fory handles natively (primitives, std containers, etc.).
+/// These do not require explicit registration.
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+        | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+        | "f32" | "f64"
+        | "bool" | "char"
+        | "String" | "str"
+        | "Vec" | "VecDeque" | "LinkedList"
+        | "Option" | "Result"
+        | "HashMap" | "BTreeMap" | "IndexMap"
+        | "HashSet" | "BTreeSet" | "IndexSet"
+        | "Box" | "Arc" | "Rc"
+        | "Cow"
+        | "Duration" | "Instant" | "SystemTime"
+        | "PathBuf" | "Path"
+        | "Bytes" | "BytesMut"
+    )
 }
 
 fn snake_to_camel(ident_str: &str) -> String {

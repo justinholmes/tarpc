@@ -430,6 +430,62 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// FNV-1a hash helper for stable wire IDs
+// ---------------------------------------------------------------------------
+
+/// Compute a stable 32-bit wire ID from a fully-qualified type name using FNV-1a.
+///
+/// The high bit is always set to avoid collision with small user-supplied IDs (< 2^31).
+/// IDs 2–9 are reserved for tarpc envelope types, so setting the high bit is safe.
+///
+/// This is a pure `const fn` — zero runtime cost.
+pub const fn fory_wire_id(name: &str) -> u32 {
+    const FNV_PRIME: u32 = 16777619;
+    const FNV_OFFSET: u32 = 2166136261;
+    let bytes = name.as_bytes();
+    let mut hash = FNV_OFFSET;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    // Set high bit to avoid collisions with small manually-assigned IDs (envelope IDs 2-9).
+    hash | 0x8000_0000
+}
+
+// ---------------------------------------------------------------------------
+// ServiceWireSchema trait
+// ---------------------------------------------------------------------------
+
+/// Per-service wire schema — proc-macro emits one impl per `#[tarpc::service]` trait.
+///
+/// Implementors are the generated `XxxService` marker structs (emitted alongside the
+/// `Xxx` trait by the proc-macro). The `register` function auto-registers all types
+/// this service transports: tarpc envelope wrappers, the generated `XxxRequest` /
+/// `XxxResponse` enums, and any user types referenced in method signatures.
+///
+/// Use [`tarpc::serde_transport::fory::connect`] and
+/// [`tarpc::serde_transport::fory::listen`] which call `S::register` automatically
+/// before creating the transport.
+pub trait ServiceWireSchema: Sized + 'static {
+    /// The generated request enum.
+    type Req: Serializer + ForyDefault + Send + 'static;
+    /// The generated response enum.
+    type Resp: Serializer + ForyDefault + Send + 'static;
+
+    /// Register all types this service transports.
+    ///
+    /// This is called automatically by [`connect`] and [`listen`]. You only need
+    /// to call this directly if building a [`Fory`] instance manually.
+    ///
+    /// [`connect`]: crate::serde_transport::fory::connect
+    /// [`listen`]: crate::serde_transport::fory::listen
+    /// [`Fory`]: fory::Fory
+    fn register(fory: &mut fory::Fory) -> Result<(), fory::Error>;
+}
+
+// ---------------------------------------------------------------------------
 // Conversions: native → wrapper
 // ---------------------------------------------------------------------------
 
