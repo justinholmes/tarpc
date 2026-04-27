@@ -463,6 +463,18 @@ pub fn service(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
+    // Always emit a `#[cfg_attr(feature = "fory", derive(::fory::ForyObject))]` guard on the
+    // generated request/response enums.  The `cfg_attr` is evaluated at the *user's* crate
+    // compile time, not here — so the ForyObject derive (and its fory_core dependency) is only
+    // activated when the user's own crate opts into the `fory` feature.  When the feature is
+    // off, the attribute is a no-op and no fory code is pulled in.
+    //
+    // Note: this is emitted unconditionally regardless of whether the `fory` feature is active
+    // on tarpc-plugins itself; the guard lives in the generated source, not in the macro.
+    let fory_derive: TokenStream2 = quote! {
+        #[cfg_attr(feature = "fory", derive(::fory::ForyObject))]
+    };
+
     let methods = rpcs.iter().map(|rpc| &rpc.ident).collect::<Vec<_>>();
     let request_names = methods
         .iter()
@@ -501,6 +513,7 @@ pub fn service(attr: TokenStream, input: TokenStream) -> TokenStream {
             .map(|(rpc, name)| Ident::new(name, rpc.ident.span()))
             .collect::<Vec<_>>(),
         derives: derives.as_ref(),
+        fory_derive: &fory_derive,
         warnings: &derive_meta.warnings,
     }
     .into_token_stream()
@@ -528,6 +541,10 @@ struct ServiceGenerator<'a> {
     return_types: &'a [&'a Type],
     arg_pats: &'a [Vec<&'a Pat>],
     derives: Option<&'a TokenStream2>,
+    /// `#[cfg_attr(feature = "fory", derive(::fory::ForyObject))]` — always emitted on the
+    /// generated request/response enums.  The `cfg_attr` is a no-op unless the user's crate
+    /// enables the `fory` feature; no fory code is pulled in otherwise.
+    fory_derive: &'a TokenStream2,
     warnings: &'a [TokenStream2],
 }
 
@@ -644,6 +661,7 @@ impl ServiceGenerator<'_> {
     fn enum_request(&self) -> TokenStream2 {
         let &Self {
             derives,
+            fory_derive,
             vis,
             request_ident,
             camel_case_idents,
@@ -658,6 +676,7 @@ impl ServiceGenerator<'_> {
             #[allow(missing_docs)]
             #[derive(Debug)]
             #derives
+            #fory_derive
             #vis enum #request_ident {
                 #(
                     #( #method_cfgs )*
@@ -682,6 +701,7 @@ impl ServiceGenerator<'_> {
     fn enum_response(&self) -> TokenStream2 {
         let &Self {
             derives,
+            fory_derive,
             vis,
             response_ident,
             camel_case_idents,
@@ -694,6 +714,7 @@ impl ServiceGenerator<'_> {
             #[allow(missing_docs)]
             #[derive(Debug)]
             #derives
+            #fory_derive
             #vis enum #response_ident {
                 #( #camel_case_idents(#return_types) ),*
             }

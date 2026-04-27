@@ -8,6 +8,7 @@ use tokio_serde::formats::Json;
 
 #[tarpc::derive_serde]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "fory", derive(fory::ForyObject))]
 pub enum TestData {
     Black,
     White,

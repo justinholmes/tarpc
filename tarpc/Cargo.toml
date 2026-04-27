@@ -24,7 +24,7 @@ tokio1 = ["tokio/rt"]
 serde-transport = ["serde1", "tokio1", "tokio-serde", "tokio-util/codec"]
 serde-transport-json = ["serde-transport", "tokio-serde/json"]
 serde-transport-bincode = ["serde-transport", "tokio-serde/bincode"]
-fory = ["dep:fory", "dep:fory-core"]
+fory = ["dep:fory", "dep:fory-core", "tarpc-plugins/fory"]
 serde-transport-fory = ["serde-transport", "fory", "dep:tokio-serde-fory"]
 tcp = ["tokio/net"]
 unix = ["tokio/net"]
@@ -134,3 +134,7 @@ required-features = ["serde-transport-fory", "tcp"]
 [[test]]
 name = "codec_parity"
 required-features = ["serde-transport-fory"]
+
+[[test]]
+name = "fory_service"
+required-features = ["serde-transport-fory", "tcp"]
