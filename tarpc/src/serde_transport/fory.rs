@@ -175,6 +175,259 @@ where
 #[cfg(feature = "tcp")]
 pub use tcp::{Incoming, connect, connect_with_fory, listen, listen_with_fory};
 
+#[cfg(all(feature = "tcp", feature = "serde-transport-fory-tls"))]
+pub use tls::{TlsIncoming, connect_tls, connect_tls_with_fory, listen_tls, listen_tls_with_fory};
+
+// ---------------------------------------------------------------------------
+// TLS support (requires `serde-transport-fory-tls` + `tcp` features)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "tcp", feature = "serde-transport-fory-tls"))]
+mod tls {
+    use super::*;
+    use super::super::fory_envelope::ServiceWireSchema;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+    use tokio::sync::{mpsc, watch};
+    use tokio_rustls::rustls::{ClientConfig, ServerConfig, pki_types::ServerName};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use tokio_rustls::client::TlsStream as ClientTlsStream;
+    use tokio_rustls::server::TlsStream as ServerTlsStream;
+    use tokio_util::codec::length_delimited;
+
+    const MAX_FRAME_LEN: usize = 64 * 1024 * 1024; // 64 MiB — matches cloudverve fabric framing
+
+    // -----------------------------------------------------------------------
+    // connect_tls (schema-driven)
+    // -----------------------------------------------------------------------
+
+    /// Schema-driven TLS connect. Mirrors [`super::tcp::connect`] but wraps the
+    /// stream in a TLS layer using the supplied [`ClientConfig`] watch channel.
+    ///
+    /// The `watch::Receiver<Arc<ClientConfig>>` pattern lets callers rotate
+    /// client certificates without reconnect storms: update the sender and all
+    /// subsequent new connections will pick up the fresh config.
+    pub async fn connect_tls<S, A>(
+        addr: A,
+        tls_config: watch::Receiver<Arc<ClientConfig>>,
+        server_name: ServerName<'static>,
+    ) -> io::Result<
+        Transport<
+            ClientTlsStream<TcpStream>,
+            Response<S::Resp>,
+            ClientMessage<S::Req>,
+            ForyEnvelopeCodec<S::Req, S::Resp>,
+        >,
+    >
+    where
+        S: ServiceWireSchema,
+        A: ToSocketAddrs,
+        S::Req: Clone,
+        ClientMessage<S::Req>: serde::Serialize,
+        Response<S::Resp>: for<'de> serde::Deserialize<'de>,
+    {
+        let mut fory_inst = fory::Fory::default();
+        S::register(&mut fory_inst)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        connect_tls_with_fory::<A, S::Req, S::Resp>(
+            addr,
+            Arc::new(fory_inst),
+            tls_config,
+            server_name,
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // connect_tls_with_fory (manual Fory)
+    // -----------------------------------------------------------------------
+
+    /// Manual-Fory TLS connect. The caller supplies a pre-configured [`Fory`]
+    /// instance with all necessary types registered.
+    pub async fn connect_tls_with_fory<A, Req, Resp>(
+        addr: A,
+        fory: Arc<fory::Fory>,
+        tls_config: watch::Receiver<Arc<ClientConfig>>,
+        server_name: ServerName<'static>,
+    ) -> io::Result<
+        Transport<
+            ClientTlsStream<TcpStream>,
+            Response<Resp>,
+            ClientMessage<Req>,
+            ForyEnvelopeCodec<Req, Resp>,
+        >,
+    >
+    where
+        A: ToSocketAddrs,
+        Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+        ClientMessage<Req>: serde::Serialize,
+        Response<Resp>: for<'de> serde::Deserialize<'de>,
+    {
+        let stream = TcpStream::connect(addr).await?;
+        // Snapshot the current config; new connections always use the latest.
+        let connector = TlsConnector::from(tls_config.borrow().clone());
+        let tls_stream = connector.connect(server_name, stream).await?;
+        let framed = length_delimited::Builder::new()
+            .max_frame_length(MAX_FRAME_LEN)
+            .new_framed(tls_stream);
+        Ok(serde_transport::new(framed, ForyEnvelopeCodec::new(fory)))
+    }
+
+    // -----------------------------------------------------------------------
+    // listen_tls (schema-driven)
+    // -----------------------------------------------------------------------
+
+    /// Schema-driven TLS listen. Mirrors [`super::tcp::listen`] but wraps each
+    /// accepted connection in a TLS layer.
+    ///
+    /// The `watch::Receiver<Arc<ServerConfig>>` pattern supports cert rotation:
+    /// update the sender and all subsequent TLS handshakes use the new cert
+    /// without dropping existing connections.
+    pub async fn listen_tls<S, A>(
+        addr: A,
+        tls_config: watch::Receiver<Arc<ServerConfig>>,
+    ) -> io::Result<TlsIncoming<S::Req, S::Resp>>
+    where
+        S: ServiceWireSchema,
+        A: ToSocketAddrs,
+        S::Req: Clone + Unpin,
+        S::Resp: Clone + Unpin,
+        Response<S::Resp>: serde::Serialize,
+        ClientMessage<S::Req>: for<'de> serde::Deserialize<'de>,
+    {
+        let mut fory_inst = fory::Fory::default();
+        S::register(&mut fory_inst)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        listen_tls_with_fory::<A, S::Req, S::Resp>(addr, Arc::new(fory_inst), tls_config).await
+    }
+
+    // -----------------------------------------------------------------------
+    // listen_tls_with_fory / TlsIncoming
+    // -----------------------------------------------------------------------
+
+    /// Manual-Fory TLS listen.
+    pub async fn listen_tls_with_fory<A, Req, Resp>(
+        addr: A,
+        fory: Arc<fory::Fory>,
+        tls_config: watch::Receiver<Arc<ServerConfig>>,
+    ) -> io::Result<TlsIncoming<Req, Resp>>
+    where
+        A: ToSocketAddrs,
+        Req: fory::Serializer + fory::ForyDefault + Clone + Send + Unpin + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + Unpin + 'static,
+        Response<Resp>: serde::Serialize,
+        ClientMessage<Req>: for<'de> serde::Deserialize<'de>,
+    {
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+
+        // Design note: `Stream::poll_next` is synchronous but TLS handshakes are
+        // async. Rather than pin-projecting an in-flight handshake future onto the
+        // struct (which works but requires unsafe or pin_project and makes the type
+        // non-Send without care), we spawn a single background task that loops on
+        // `accept` + TLS handshake and pushes fully-built transports into an mpsc
+        // channel. `TlsIncoming::poll_next` simply polls the receiver — one task
+        // per listener, zero extra allocation per connection. The background task
+        // runs until the listener errors or is dropped, which closes the sender
+        // and causes the receiver-side stream to terminate naturally.
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(accept_loop::<Req, Resp>(listener, fory, tls_config, tx));
+
+        Ok(TlsIncoming { rx, local_addr, _marker: std::marker::PhantomData })
+    }
+
+    type IncomingTransport<Req, Resp> = Transport<
+        ServerTlsStream<TcpStream>,
+        ClientMessage<Req>,
+        Response<Resp>,
+        ForyEnvelopeCodec<Req, Resp>,
+    >;
+
+    async fn accept_loop<Req, Resp>(
+        listener: TcpListener,
+        fory: Arc<fory::Fory>,
+        tls_config: watch::Receiver<Arc<ServerConfig>>,
+        tx: mpsc::Sender<io::Result<IncomingTransport<Req, Resp>>>,
+    ) where
+        Req: fory::Serializer + fory::ForyDefault + Clone + Send + Unpin + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + Unpin + 'static,
+        Response<Resp>: serde::Serialize,
+        ClientMessage<Req>: for<'de> serde::Deserialize<'de>,
+    {
+        loop {
+            let tcp_result = listener.accept().await;
+            let (stream, _peer) = match tcp_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+
+            // Snapshot the current server config at handshake time — this is
+            // the cert-rotation hook: each new TLS handshake picks up whatever
+            // ServerConfig is current in the watch channel.
+            let acceptor = TlsAcceptor::from(tls_config.borrow().clone());
+            let fory_clone = fory.clone();
+            let tx_clone = tx.clone();
+
+            // Spawn each handshake concurrently so a slow client can't stall
+            // subsequent accepts.
+            tokio::spawn(async move {
+                let result = async {
+                    let tls_stream = acceptor.accept(stream).await?;
+                    let framed = length_delimited::Builder::new()
+                        .max_frame_length(MAX_FRAME_LEN)
+                        .new_framed(tls_stream);
+                    io::Result::Ok(serde_transport::new(
+                        framed,
+                        ForyEnvelopeCodec::<Req, Resp>::new(fory_clone),
+                    ))
+                }
+                .await;
+                let _ = tx_clone.send(result).await;
+            });
+        }
+    }
+
+    /// Stream of TLS-wrapped server-side fory transports.
+    ///
+    /// Each item is a fully-handshaked [`Transport`] ready for use with
+    /// [`tarpc::server::BaseChannel`].
+    pub struct TlsIncoming<Req, Resp> {
+        rx: mpsc::Receiver<io::Result<IncomingTransport<Req, Resp>>>,
+        local_addr: SocketAddr,
+        _marker: std::marker::PhantomData<(Req, Resp)>,
+    }
+
+    impl<Req, Resp> TlsIncoming<Req, Resp> {
+        /// Returns the local address this listener is bound to.
+        pub fn local_addr(&self) -> SocketAddr {
+            self.local_addr
+        }
+    }
+
+    impl<Req, Resp> futures::stream::Stream for TlsIncoming<Req, Resp>
+    where
+        Req: fory::Serializer + fory::ForyDefault + Clone + Send + Unpin + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + Unpin + 'static,
+        Response<Resp>: serde::Serialize,
+        ClientMessage<Req>: for<'de> serde::Deserialize<'de>,
+    {
+        type Item = io::Result<IncomingTransport<Req, Resp>>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.rx.poll_recv(cx)
+        }
+    }
+}
+
 #[cfg(feature = "tcp")]
 mod tcp {
     use super::*;

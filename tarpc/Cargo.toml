@@ -26,6 +26,7 @@ serde-transport-json = ["serde-transport", "tokio-serde/json"]
 serde-transport-bincode = ["serde-transport", "tokio-serde/bincode"]
 fory = ["dep:fory", "dep:fory-core", "tarpc-plugins/fory"]
 serde-transport-fory = ["serde-transport", "fory", "dep:tokio-serde-fory"]
+serde-transport-fory-tls = ["serde-transport-fory", "dep:tokio-rustls"]
 tcp = ["tokio/net"]
 unix = ["tokio/net"]
 
@@ -58,6 +59,7 @@ tokio-serde = { optional = true, version = "0.9" }
 fory = { version = "0.17", optional = true }
 fory-core = { version = "0.17", optional = true }
 tokio-serde-fory = { path = "../../tokio-serde-fory", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
 tracing = { version = "0.1", default-features = false, features = [
     "attributes",
     "log",
@@ -86,6 +88,7 @@ tokio-serde = { version = "0.9", features = ["json", "bincode"] }
 trybuild = "1.0"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
+rcgen = "0.13"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -138,3 +141,7 @@ required-features = ["serde-transport-fory"]
 [[test]]
 name = "fory_service"
 required-features = ["serde-transport-fory", "tcp"]
+
+[[test]]
+name = "fory_tls"
+required-features = ["serde-transport-fory-tls", "tcp"]
