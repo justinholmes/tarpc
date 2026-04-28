@@ -145,3 +145,7 @@ required-features = ["serde-transport-fory", "tcp"]
 [[test]]
 name = "fory_tls"
 required-features = ["serde-transport-fory-tls", "tcp"]
+
+[[test]]
+name = "fory_zerocopy"
+required-features = ["serde-transport-fory", "tcp"]

@@ -16,6 +16,10 @@ pub mod fory_envelope;
 #[path = "serde_transport/fory.rs"]
 pub mod fory;
 
+#[cfg(all(feature = "serde-transport-fory", feature = "tcp"))]
+#[path = "serde_transport/fory_zerocopy.rs"]
+pub mod fory_zerocopy;
+
 use futures::{prelude::*, task::*};
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};

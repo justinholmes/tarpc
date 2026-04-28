@@ -1,0 +1,457 @@
+//! Zero-copy bulk-payload codec at the tokio-util Codec level.
+//!
+//! This module adds a new codec (`ZeroCopyForyCodec`) and transport API
+//! (`ZeroCopyTransport` / `ZeroCopyIncoming`) that operate directly at the
+//! `tokio_util::codec` layer — bypassing tokio-serde — so that large body
+//! payloads can be sliced out of the incoming frame buffer without copying.
+//!
+//! # Wire format
+//!
+//! Each length-delimited frame contains:
+//!
+//! ```text
+//! [ fory-encoded envelope (variable) ][ body bytes (variable) ][ body_len: u32 LE ]
+//! ```
+//!
+//! If `body_len == 0` there is no bulk payload and the decoded body is `None`.
+//!
+//! # Zero-copy proof
+//!
+//! On the decode path, [`tokio_util::codec::Decoder::decode`] receives a
+//! `&mut BytesMut`.  After the length-delimited inner codec extracts a frame,
+//! `split_off` is used to obtain the body region as a new `BytesMut` that
+//! shares the same underlying allocation.  `.freeze()` produces a `Bytes` that
+//! aliases the same memory — no copy occurs for the body bytes.
+//!
+//! The canonical proof is `tarpc/tests/fory_zerocopy.rs::body_is_aliased`.
+
+use super::fory_envelope::{ForyClientMessage, ForyResponse};
+use crate::{ClientMessage, Response};
+use fory::Fory;
+use futures::{ready, Sink, Stream};
+use pin_project::pin_project;
+use std::{
+    io,
+    marker::PhantomData,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_util::bytes::{Bytes, BytesMut};
+use tokio_util::codec::{Encoder as _, Framed, LengthDelimitedCodec};
+
+// Maximum frame length: 64 MiB — matches cloudverve fabric framing.
+const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Server-side codec: decodes (ClientMessage<Req>, Option<Bytes>)
+//                    encodes (Response<Resp>, Option<Bytes>)
+// ---------------------------------------------------------------------------
+
+/// Tokio-util codec for zero-copy bulk-payload framing on the **server** side.
+///
+/// - `Decoder::Item` = `(ClientMessage<Req>, Option<Bytes>)`
+/// - `Encoder::Item` = `(Response<Resp>, Option<Bytes>)`
+pub struct ServerZeroCopyCodec<Req, Resp> {
+    fory: Arc<Fory>,
+    inner: LengthDelimitedCodec,
+    _marker: PhantomData<(Req, Resp)>,
+}
+
+impl<Req, Resp> ServerZeroCopyCodec<Req, Resp> {
+    /// Create a new server-side codec.
+    pub fn new(fory: Arc<Fory>) -> Self {
+        let mut inner = LengthDelimitedCodec::new();
+        inner.set_max_frame_length(MAX_FRAME_LEN);
+        Self { fory, inner, _marker: PhantomData }
+    }
+}
+
+impl<Req, Resp> tokio_util::codec::Decoder for ServerZeroCopyCodec<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    type Item = (ClientMessage<Req>, Option<Bytes>);
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let mut frame = match self.inner.decode(src)? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let (envelope, body) = split_frame_body(&mut frame)?;
+        let wrapper: ForyClientMessage<Req> = self
+            .fory
+            .deserialize(&envelope[..])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Some((ClientMessage::from(wrapper), body)))
+    }
+}
+
+impl<Req, Resp> tokio_util::codec::Encoder<(Response<Resp>, Option<Bytes>)>
+    for ServerZeroCopyCodec<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    type Error = io::Error;
+
+    fn encode(
+        &mut self,
+        item: (Response<Resp>, Option<Bytes>),
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
+        let (resp, body) = item;
+        let wrapper = ForyResponse::<Resp>::from(&resp);
+        let envelope_bytes = self
+            .fory
+            .serialize(&wrapper)
+            .map(Bytes::from)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        encode_frame(&mut self.inner, envelope_bytes, body, dst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client-side codec: decodes (Response<Resp>, Option<Bytes>)
+//                    encodes (ClientMessage<Req>, Option<Bytes>)
+// ---------------------------------------------------------------------------
+
+/// Tokio-util codec for zero-copy bulk-payload framing on the **client** side.
+///
+/// - `Decoder::Item` = `(Response<Resp>, Option<Bytes>)`
+/// - `Encoder::Item` = `(ClientMessage<Req>, Option<Bytes>)`
+pub struct ClientZeroCopyCodec<Req, Resp> {
+    fory: Arc<Fory>,
+    inner: LengthDelimitedCodec,
+    _marker: PhantomData<(Req, Resp)>,
+}
+
+impl<Req, Resp> ClientZeroCopyCodec<Req, Resp> {
+    /// Create a new client-side codec.
+    pub fn new(fory: Arc<Fory>) -> Self {
+        let mut inner = LengthDelimitedCodec::new();
+        inner.set_max_frame_length(MAX_FRAME_LEN);
+        Self { fory, inner, _marker: PhantomData }
+    }
+}
+
+impl<Req, Resp> tokio_util::codec::Decoder for ClientZeroCopyCodec<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+{
+    type Item = (Response<Resp>, Option<Bytes>);
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let mut frame = match self.inner.decode(src)? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let (envelope, body) = split_frame_body(&mut frame)?;
+        let wrapper: ForyResponse<Resp> = self
+            .fory
+            .deserialize(&envelope[..])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Some((Response::from(wrapper), body)))
+    }
+}
+
+impl<Req, Resp> tokio_util::codec::Encoder<(ClientMessage<Req>, Option<Bytes>)>
+    for ClientZeroCopyCodec<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+{
+    type Error = io::Error;
+
+    fn encode(
+        &mut self,
+        item: (ClientMessage<Req>, Option<Bytes>),
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
+        let (msg, body) = item;
+        let wrapper = ForyClientMessage::<Req>::from(&msg);
+        let envelope_bytes = self
+            .fory
+            .serialize(&wrapper)
+            .map(Bytes::from)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        encode_frame(&mut self.inner, envelope_bytes, body, dst)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared encode / decode helpers
+// ---------------------------------------------------------------------------
+
+/// Split a frame into (envelope_region, body_region) with zero-copy for the body.
+///
+/// Frame layout: `[ envelope ][ body ][ body_len: u32 LE ]`
+///
+/// The `body` `BytesMut` is obtained via `split_off`, which gives an owned
+/// `BytesMut` that shares the same underlying allocation as `frame`. Callers
+/// call `.freeze()` on it to get a `Bytes` that aliases the frame buffer.
+fn split_frame_body(frame: &mut BytesMut) -> Result<(BytesMut, Option<Bytes>), io::Error> {
+    if frame.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too small for body_len suffix",
+        ));
+    }
+    // Read body_len from the trailing 4 bytes.
+    let suffix_start = frame.len() - 4;
+    let body_len = {
+        let mut le = [0u8; 4];
+        le.copy_from_slice(&frame[suffix_start..]);
+        u32::from_le_bytes(le) as usize
+    };
+    // Drop the 4-byte suffix by truncating.
+    frame.truncate(suffix_start);
+
+    if body_len > frame.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "body_len {} exceeds remaining frame length {}",
+                body_len,
+                frame.len()
+            ),
+        ));
+    }
+
+    let body = if body_len > 0 {
+        // split_off returns a new BytesMut from body_start..end, sharing
+        // the same allocation — this is the zero-copy slice.
+        let body_start = frame.len() - body_len;
+        Some(frame.split_off(body_start).freeze())
+    } else {
+        None
+    };
+
+    Ok((frame.split_to(frame.len()), body))
+}
+
+/// Encode an envelope + optional body into a length-delimited frame.
+///
+/// Writes: `[ envelope ][ body ][ body_len: u32 LE ]` into a single frame.
+fn encode_frame(
+    inner: &mut LengthDelimitedCodec,
+    envelope: Bytes,
+    body: Option<Bytes>,
+    dst: &mut BytesMut,
+) -> Result<(), io::Error> {
+    let body_len = body.as_ref().map(|b| b.len()).unwrap_or(0) as u32;
+    let total = envelope.len() + body_len as usize + 4;
+    let mut payload = BytesMut::with_capacity(total);
+    payload.extend_from_slice(&envelope);
+    if let Some(b) = body {
+        payload.extend_from_slice(&b);
+    }
+    payload.extend_from_slice(&body_len.to_le_bytes());
+    inner
+        .encode(payload.freeze(), dst)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// ZeroCopyTransport — client-side (wraps ClientZeroCopyCodec)
+// ---------------------------------------------------------------------------
+
+/// Client-side zero-copy transport.
+///
+/// Implements `Stream<Item = io::Result<(Response<Resp>, Option<Bytes>)>>` and
+/// `Sink<(ClientMessage<Req>, Option<Bytes>)>`.
+#[pin_project]
+pub struct ZeroCopyTransport<Req, Resp> {
+    #[pin]
+    inner: Framed<TcpStream, ClientZeroCopyCodec<Req, Resp>>,
+}
+
+impl<Req, Resp> Stream for ZeroCopyTransport<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+{
+    type Item = io::Result<(Response<Resp>, Option<Bytes>)>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project()
+            .inner
+            .poll_next(cx)
+            .map_err(io::Error::other)
+    }
+}
+
+impl<Req, Resp> Sink<(ClientMessage<Req>, Option<Bytes>)> for ZeroCopyTransport<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+{
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_ready(cx).map_err(io::Error::other)
+    }
+
+    fn start_send(
+        self: Pin<&mut Self>,
+        item: (ClientMessage<Req>, Option<Bytes>),
+    ) -> io::Result<()> {
+        self.project().inner.start_send(item).map_err(io::Error::other)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx).map_err(io::Error::other)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_close(cx).map_err(io::Error::other)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZeroCopyServerTransport — server-side (wraps ServerZeroCopyCodec)
+// ---------------------------------------------------------------------------
+
+/// Server-side zero-copy transport (one accepted connection).
+///
+/// Implements `Stream<Item = io::Result<(ClientMessage<Req>, Option<Bytes>)>>` and
+/// `Sink<(Response<Resp>, Option<Bytes>)>`.
+#[pin_project]
+pub struct ZeroCopyServerTransport<Req, Resp> {
+    #[pin]
+    inner: Framed<TcpStream, ServerZeroCopyCodec<Req, Resp>>,
+}
+
+impl<Req, Resp> Stream for ZeroCopyServerTransport<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    type Item = io::Result<(ClientMessage<Req>, Option<Bytes>)>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project()
+            .inner
+            .poll_next(cx)
+            .map_err(io::Error::other)
+    }
+}
+
+impl<Req, Resp> Sink<(Response<Resp>, Option<Bytes>)> for ZeroCopyServerTransport<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_ready(cx).map_err(io::Error::other)
+    }
+
+    fn start_send(
+        self: Pin<&mut Self>,
+        item: (Response<Resp>, Option<Bytes>),
+    ) -> io::Result<()> {
+        self.project().inner.start_send(item).map_err(io::Error::other)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx).map_err(io::Error::other)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_close(cx).map_err(io::Error::other)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZeroCopyIncoming — server listener
+// ---------------------------------------------------------------------------
+
+/// Stream of server-side zero-copy transports, one per accepted TCP connection.
+#[pin_project]
+pub struct ZeroCopyIncoming<Req, Resp> {
+    #[pin]
+    listener: TcpListener,
+    fory: Arc<Fory>,
+    local_addr: SocketAddr,
+    _marker: PhantomData<(Req, Resp)>,
+}
+
+impl<Req, Resp> ZeroCopyIncoming<Req, Resp> {
+    /// Returns the local address this listener is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl<Req, Resp> Stream for ZeroCopyIncoming<Req, Resp>
+where
+    Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    type Item = io::Result<ZeroCopyServerTransport<Req, Resp>>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let accept_result = ready!(self.as_mut().project().listener.poll_accept(cx));
+        let (stream, _peer) = match accept_result {
+            Ok(pair) => pair,
+            Err(e) => return Poll::Ready(Some(Err(e))),
+        };
+        let codec = ServerZeroCopyCodec::new(self.fory.clone());
+        let framed = Framed::new(stream, codec);
+        Poll::Ready(Some(Ok(ZeroCopyServerTransport { inner: framed })))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API: connect_zerocopy / listen_zerocopy
+// ---------------------------------------------------------------------------
+
+/// Connect to `addr` and return a client-side zero-copy transport.
+///
+/// The `fory` instance must have all required envelope types and the
+/// `Req`/`Resp` types registered before calling this function. Use
+/// [`super::fory_envelope::register_envelope_types`] for the envelope types.
+pub async fn connect_zerocopy<Req, Resp, A>(
+    addr: A,
+    fory: Arc<Fory>,
+) -> io::Result<ZeroCopyTransport<Req, Resp>>
+where
+    A: ToSocketAddrs,
+    Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+{
+    let stream = TcpStream::connect(addr).await?;
+    let codec = ClientZeroCopyCodec::new(fory);
+    let framed = Framed::new(stream, codec);
+    Ok(ZeroCopyTransport { inner: framed })
+}
+
+/// Listen on `addr` and return a [`ZeroCopyIncoming`] stream of server-side
+/// zero-copy transports.
+///
+/// The `fory` instance must have all required envelope types and the
+/// `Req`/`Resp` types registered before calling this function.
+pub async fn listen_zerocopy<Req, Resp, A>(
+    addr: A,
+    fory: Arc<Fory>,
+) -> io::Result<ZeroCopyIncoming<Req, Resp>>
+where
+    A: ToSocketAddrs,
+    Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+    Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    Ok(ZeroCopyIncoming { listener, fory, local_addr, _marker: PhantomData })
+}
