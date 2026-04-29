@@ -1106,17 +1106,16 @@ impl ServiceGenerator<'_> {
                 fn register(fory: &mut ::fory::Fory) -> ::core::result::Result<(), ::fory::Error> {
                     use ::tarpc::serde_transport::fory_envelope::{
                         ForyTraceContext, ForyServerError,
-                        ForyResult, ForyRequest, ForyResponse, ForyClientMessage,
+                        ForyRequest, ForyResponse, ForyClientMessage,
                     };
                     // Non-generic envelope types (shared across all requests/responses).
                     fory.register_serializer::<ForyTraceContext>(2)?;
                     fory.register_serializer::<ForyServerError>(3)?;
+                    // ID 4 intentionally unassigned (was ForyResult<T>, now removed).
                     // Request-side parameterised envelope types.
-                    fory.register_serializer::<ForyResult<#request_ident>>(4)?;
                     fory.register_serializer::<ForyRequest<#request_ident>>(5)?;
                     fory.register_serializer::<ForyClientMessage<#request_ident>>(7)?;
-                    // Response-side parameterised envelope types (different IDs to avoid collision).
-                    fory.register_serializer::<ForyResult<#response_ident>>(8)?;
+                    // Response-side parameterised envelope type.
                     fory.register_serializer::<ForyResponse<#response_ident>>(6)?;
                     // Generated request/response enums (EXT path — no type_id_index collision).
                     fory.register_serializer::<#request_ident>(#req_id_expr)?;

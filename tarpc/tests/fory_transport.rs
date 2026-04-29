@@ -14,10 +14,7 @@ use tarpc::{
     context,
     server::{self, Channel},
     serde_transport::fory as fory_transport,
-    serde_transport::fory_envelope::{
-        ForyClientMessage, ForyRequest, ForyResponse, ForyResult, ForyServerError, ForyTraceContext,
-        register_envelope_types,
-    },
+    serde_transport::fory_envelope::register_envelope_types,
 };
 
 // ---------------------------------------------------------------------------

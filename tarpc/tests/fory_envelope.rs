@@ -17,7 +17,7 @@
 
 use fory::Fory;
 use tarpc::serde_transport::fory_envelope::{
-    ForyClientMessage, ForyRequest, ForyResponse, ForyResult, ForyServerError, ForyTraceContext,
+    ForyClientMessage, ForyRequest, ForyResponse, ForyServerError, ForyTraceContext,
     register_envelope_types,
 };
 
@@ -77,38 +77,45 @@ fn fory_server_error_round_trip() {
 }
 
 #[test]
-fn fory_result_ok_round_trip() {
+fn fory_response_ok_standalone_round_trip() {
+    // Exercises ForyResponse<u32> with discriminant 0 (Ok) directly,
+    // without going through the full register_envelope_types helper.
     let mut fory = Fory::default();
     fory.register_serializer::<ForyServerError>(3).unwrap();
-    fory.register_serializer::<ForyResult<u32>>(4).unwrap();
+    fory.register_serializer::<ForyResponse<u32>>(6).unwrap();
 
-    let original: ForyResult<u32> = ForyResult::Ok(42u32);
+    let original = ForyResponse::Ok { request_id: 10u64, value: 42u32 };
     let bytes = fory.serialize(&original).unwrap();
-    let decoded: ForyResult<u32> = fory.deserialize(&bytes).unwrap();
+    let decoded: ForyResponse<u32> = fory.deserialize(&bytes).unwrap();
     match decoded {
-        ForyResult::Ok(v) => assert_eq!(v, 42u32),
-        ForyResult::Err(_) => panic!("expected Ok variant"),
+        ForyResponse::Ok { request_id, value } => {
+            assert_eq!(request_id, 10);
+            assert_eq!(value, 42u32);
+        }
+        ForyResponse::Err { .. } => panic!("expected Ok variant"),
     }
 }
 
 #[test]
-fn fory_result_err_round_trip() {
+fn fory_response_err_standalone_round_trip() {
+    // Exercises ForyResponse<u32> with discriminant 1 (Err) directly.
     let mut fory = Fory::default();
     fory.register_serializer::<ForyServerError>(3).unwrap();
-    fory.register_serializer::<ForyResult<u32>>(4).unwrap();
+    fory.register_serializer::<ForyResponse<u32>>(6).unwrap();
 
-    let original: ForyResult<u32> = ForyResult::Err(ForyServerError {
-        kind: 0, // NotFound
-        detail: "not found".into(),
-    });
+    let original: ForyResponse<u32> = ForyResponse::Err {
+        request_id: 20,
+        error: ForyServerError { kind: 0, detail: "not found".into() },
+    };
     let bytes = fory.serialize(&original).unwrap();
-    let decoded: ForyResult<u32> = fory.deserialize(&bytes).unwrap();
+    let decoded: ForyResponse<u32> = fory.deserialize(&bytes).unwrap();
     match decoded {
-        ForyResult::Err(e) => {
-            assert_eq!(e.kind, 0);
-            assert_eq!(e.detail, "not found");
+        ForyResponse::Err { request_id, error } => {
+            assert_eq!(request_id, 20);
+            assert_eq!(error.kind, 0);
+            assert_eq!(error.detail, "not found");
         }
-        ForyResult::Ok(_) => panic!("expected Err variant"),
+        ForyResponse::Ok { .. } => panic!("expected Err variant"),
     }
 }
 
@@ -134,32 +141,34 @@ fn fory_request_round_trip() {
 #[test]
 fn fory_response_ok_round_trip() {
     let fory = make_fory_u32();
-    let original = ForyResponse { request_id: 1u64, message: ForyResult::Ok(42u32) };
+    let original = ForyResponse::Ok { request_id: 1u64, value: 42u32 };
     let bytes = fory.serialize(&original).unwrap();
     let decoded: ForyResponse<u32> = fory.deserialize(&bytes).unwrap();
-    assert_eq!(decoded.request_id, 1);
-    match decoded.message {
-        ForyResult::Ok(v) => assert_eq!(v, 42u32),
-        ForyResult::Err(_) => panic!("expected Ok"),
+    match decoded {
+        ForyResponse::Ok { request_id, value } => {
+            assert_eq!(request_id, 1);
+            assert_eq!(value, 42u32);
+        }
+        ForyResponse::Err { .. } => panic!("expected Ok"),
     }
 }
 
 #[test]
 fn fory_response_err_round_trip() {
     let fory = make_fory_u32();
-    let original = ForyResponse::<u32> {
+    let original = ForyResponse::<u32>::Err {
         request_id: 2,
-        message: ForyResult::Err(ForyServerError { kind: 1, detail: "permission denied".into() }),
+        error: ForyServerError { kind: 1, detail: "permission denied".into() },
     };
     let bytes = fory.serialize(&original).unwrap();
     let decoded: ForyResponse<u32> = fory.deserialize(&bytes).unwrap();
-    assert_eq!(decoded.request_id, 2);
-    match decoded.message {
-        ForyResult::Err(e) => {
-            assert_eq!(e.kind, 1);
-            assert_eq!(e.detail, "permission denied");
+    match decoded {
+        ForyResponse::Err { request_id, error } => {
+            assert_eq!(request_id, 2);
+            assert_eq!(error.kind, 1);
+            assert_eq!(error.detail, "permission denied");
         }
-        ForyResult::Ok(_) => panic!("expected Err"),
+        ForyResponse::Ok { .. } => panic!("expected Err"),
     }
 }
 

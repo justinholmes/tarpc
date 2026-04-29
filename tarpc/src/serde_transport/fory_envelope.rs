@@ -156,71 +156,6 @@ impl Serializer for ForyServerError {
     }
 }
 
-/// Fory-serializable analog of `Result<T, ServerError>`.
-///
-/// fory-core 0.17 has no `Serializer` impl for `std::result::Result`, so we
-/// define a dedicated two-variant enum.
-///
-/// Wire encoding: u8 discriminant (0 = Ok, 1 = Err) followed by the payload.
-#[derive(Debug, Clone)]
-pub enum ForyResult<T: Serializer + ForyDefault + 'static> {
-    /// Successful response payload.
-    Ok(T),
-    /// Server-side error.
-    Err(ForyServerError),
-}
-
-impl<T: Serializer + ForyDefault + 'static> ForyDefault for ForyResult<T> {
-    fn fory_default() -> Self {
-        ForyResult::Ok(T::fory_default())
-    }
-}
-
-impl<T: Serializer + ForyDefault + 'static> Serializer for ForyResult<T> {
-    fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
-        match self {
-            ForyResult::Ok(v) => {
-                context.writer.write_u8(0);
-                v.fory_write(context, RefMode::None, false, false)?;
-            }
-            ForyResult::Err(e) => {
-                context.writer.write_u8(1);
-                e.fory_write(context, RefMode::None, false, false)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn fory_read_data(context: &mut ReadContext) -> Result<Self, Error>
-    where
-        Self: Sized + ForyDefault,
-    {
-        let discriminant = context.reader.read_u8()?;
-        match discriminant {
-            0 => {
-                let v = T::fory_read(context, RefMode::None, false)?;
-                Ok(ForyResult::Ok(v))
-            }
-            1 => {
-                let e = ForyServerError::fory_read(context, RefMode::None, false)?;
-                Ok(ForyResult::Err(e))
-            }
-            _ => Err(Error::invalid_data(format!(
-                "ForyResult: unknown discriminant {}",
-                discriminant
-            ))),
-        }
-    }
-
-    fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
-        Self::fory_get_type_id(type_resolver)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 /// Fory-serializable mirror of `Request<T>`.
 ///
 /// `context::Context.deadline` (an `Instant`) is replaced by `deadline_ns`:
@@ -278,27 +213,48 @@ impl<T: Serializer + ForyDefault + 'static> Serializer for ForyRequest<T> {
 }
 
 /// Fory-serializable mirror of `Response<T>`.
+///
+/// Wire encoding: u8 discriminant (0 = Ok, 1 = Err), then request_id, then payload.
+/// This is a flattened form that eliminates the former intermediate `ForyResult<T>` type,
+/// reducing the number of registered types by one.
 #[derive(Debug, Clone)]
-pub struct ForyResponse<T: Serializer + ForyDefault + 'static> {
-    /// ID of the request this is responding to.
-    pub request_id: u64,
-    /// Response body or server error.
-    pub message: ForyResult<T>,
+pub enum ForyResponse<T: Serializer + ForyDefault + 'static> {
+    /// Successful response.
+    Ok {
+        /// ID of the request this is responding to.
+        request_id: u64,
+        /// Response payload.
+        value: T,
+    },
+    /// Server-side error response.
+    Err {
+        /// ID of the request this is responding to.
+        request_id: u64,
+        /// Server error detail.
+        error: ForyServerError,
+    },
 }
 
 impl<T: Serializer + ForyDefault + 'static> ForyDefault for ForyResponse<T> {
     fn fory_default() -> Self {
-        ForyResponse {
-            request_id: 0,
-            message: ForyResult::fory_default(),
-        }
+        ForyResponse::Ok { request_id: 0, value: T::fory_default() }
     }
 }
 
 impl<T: Serializer + ForyDefault + 'static> Serializer for ForyResponse<T> {
     fn fory_write_data(&self, context: &mut WriteContext) -> Result<(), Error> {
-        self.request_id.fory_write(context, RefMode::None, false, false)?;
-        self.message.fory_write(context, RefMode::None, false, false)?;
+        match self {
+            ForyResponse::Ok { request_id, value } => {
+                context.writer.write_u8(0);
+                request_id.fory_write(context, RefMode::None, false, false)?;
+                value.fory_write(context, RefMode::None, false, false)?;
+            }
+            ForyResponse::Err { request_id, error } => {
+                context.writer.write_u8(1);
+                request_id.fory_write(context, RefMode::None, false, false)?;
+                error.fory_write(context, RefMode::None, false, false)?;
+            }
+        }
         Ok(())
     }
 
@@ -306,9 +262,23 @@ impl<T: Serializer + ForyDefault + 'static> Serializer for ForyResponse<T> {
     where
         Self: Sized + ForyDefault,
     {
-        let request_id = u64::fory_read(context, RefMode::None, false)?;
-        let message = ForyResult::<T>::fory_read(context, RefMode::None, false)?;
-        Ok(ForyResponse { request_id, message })
+        let discriminant = context.reader.read_u8()?;
+        match discriminant {
+            0 => {
+                let request_id = u64::fory_read(context, RefMode::None, false)?;
+                let value = T::fory_read(context, RefMode::None, false)?;
+                Ok(ForyResponse::Ok { request_id, value })
+            }
+            1 => {
+                let request_id = u64::fory_read(context, RefMode::None, false)?;
+                let error = ForyServerError::fory_read(context, RefMode::None, false)?;
+                Ok(ForyResponse::Err { request_id, error })
+            }
+            _ => Err(Error::invalid_data(format!(
+                "ForyResponse: unknown discriminant {}",
+                discriminant
+            ))),
+        }
     }
 
     fn fory_type_id_dyn(&self, type_resolver: &TypeResolver) -> Result<fory::TypeId, Error> {
@@ -409,8 +379,10 @@ impl<T: Serializer + ForyDefault + 'static> Serializer for ForyClientMessage<T> 
 /// fory.register_serializer::<HelloResponse>(101).unwrap();
 /// ```
 ///
-/// The IDs 2–7 are reserved for the tarpc envelope types. User types must
-/// use IDs >= 100 (or any value that does not conflict).
+/// The IDs 2–3 and 5–7 are reserved for the tarpc envelope types (ID 4 was
+/// previously used by the now-deleted `ForyResult<T>`; it is intentionally left
+/// unassigned to avoid wire-format conflicts with existing deployments). User
+/// types must use IDs >= 100 (or any value that does not conflict).
 ///
 /// Note: if the server sends `ForyClientMessage<Req>` and `ForyResponse<Resp>`,
 /// you need to call this for both `Req` and `Resp` when both are user-defined
@@ -422,7 +394,7 @@ where
 {
     fory.register_serializer::<ForyTraceContext>(2)?;
     fory.register_serializer::<ForyServerError>(3)?;
-    fory.register_serializer::<ForyResult<T>>(4)?;
+    // ID 4 intentionally unassigned (was ForyResult<T>, now removed).
     fory.register_serializer::<ForyRequest<T>>(5)?;
     fory.register_serializer::<ForyResponse<T>>(6)?;
     fory.register_serializer::<ForyClientMessage<T>>(7)?;
@@ -630,41 +602,27 @@ impl<T: Serializer + ForyDefault + 'static> From<ForyRequest<T>> for Request<T> 
     }
 }
 
-impl<T: Serializer + ForyDefault + 'static> From<Result<T, ServerError>> for ForyResult<T> {
-    fn from(r: Result<T, ServerError>) -> Self {
-        match r {
-            Ok(v) => ForyResult::Ok(v),
-            Err(e) => ForyResult::Err(ForyServerError::from(&e)),
-        }
-    }
-}
-
-impl<T: Serializer + ForyDefault + 'static> From<ForyResult<T>> for Result<T, ServerError> {
-    fn from(fr: ForyResult<T>) -> Self {
-        match fr {
-            ForyResult::Ok(v) => Ok(v),
-            ForyResult::Err(e) => Err(ServerError::from(e)),
-        }
-    }
-}
-
-impl<T: Serializer + ForyDefault + 'static> From<&Response<T>> for ForyResponse<T>
-where
-    T: Clone,
-{
+impl<T: Serializer + ForyDefault + Clone + 'static> From<&Response<T>> for ForyResponse<T> {
     fn from(resp: &Response<T>) -> Self {
-        ForyResponse {
-            request_id: resp.request_id,
-            message: ForyResult::from(resp.message.clone()),
+        match &resp.message {
+            Ok(v) => ForyResponse::Ok { request_id: resp.request_id, value: v.clone() },
+            Err(e) => ForyResponse::Err {
+                request_id: resp.request_id,
+                error: ForyServerError::from(e),
+            },
         }
     }
 }
 
 impl<T: Serializer + ForyDefault + 'static> From<ForyResponse<T>> for Response<T> {
     fn from(fr: ForyResponse<T>) -> Self {
-        Response {
-            request_id: fr.request_id,
-            message: Result::from(fr.message),
+        match fr {
+            ForyResponse::Ok { request_id, value } => {
+                Response { request_id, message: Ok(value) }
+            }
+            ForyResponse::Err { request_id, error } => {
+                Response { request_id, message: Err(ServerError::from(error)) }
+            }
         }
     }
 }
