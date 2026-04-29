@@ -163,18 +163,15 @@ async fn raw_transport_multiple_round_trips() {
     // Server: echo each request back.
     tokio::spawn(async move {
         if let Some(Ok(mut server_transport)) = incoming.next().await {
-            loop {
-                match futures::StreamExt::next(&mut server_transport).await {
-                    Some(Ok(ClientMessage::Request(req))) => {
-                        let resp = Response {
-                            request_id: req.id,
-                            message: Ok(format!("resp:{}", req.message)),
-                        };
-                        if server_transport.send(resp).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
+            while let Some(Ok(ClientMessage::Request(req))) =
+                futures::StreamExt::next(&mut server_transport).await
+            {
+                let resp = Response {
+                    request_id: req.id,
+                    message: Ok(format!("resp:{}", req.message)),
+                };
+                if server_transport.send(resp).await.is_err() {
+                    break;
                 }
             }
         }

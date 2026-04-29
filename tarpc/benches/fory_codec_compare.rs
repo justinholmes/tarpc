@@ -3,12 +3,12 @@
 //!
 //! # Workloads
 //!
-//! - `send_4mib`        — encode side only. Client encodes a 4 MiB frame;
-//!                        server discards it. Measures serialisation + framing.
-//! - `recv_4mib`        — decode side only. Server sends a 4 MiB response back;
-//!                        client receives it. recv path is where zero-copy wins.
-//! - `roundtrip_small`  — ping-shaped: empty body, full send+recv round-trip.
-//!                        Regression guard — expected within ±5%.
+//! - `send_4mib`       — encode side only. Client encodes a 4 MiB frame;
+//!   server discards it. Measures serialisation + framing.
+//! - `recv_4mib`       — decode side only. Server sends a 4 MiB response back;
+//!   client receives it. recv path is where zero-copy wins.
+//! - `roundtrip_small` — ping-shaped: empty body, full send+recv round-trip.
+//!   Regression guard — expected within ±5%.
 //!
 //! # Connection reuse
 //!

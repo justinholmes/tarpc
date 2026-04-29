@@ -1205,6 +1205,12 @@ fn collect_type_registrations(
                     let key = quote! { #path }.to_string();
                     if seen.insert(key) {
                         out.push(quote! {
+                            // NOTE: std::any::type_name is not guaranteed stable across compiler versions.
+                            // If a client compiled with one Rust version and a server with another produce
+                            // different type_name strings, they'll compute different wire IDs. For stability,
+                            // prefer passing the stringified path as a const (like we do for generated enums
+                            // via concat!(module_path!(), "::", ...)). This is a known limitation for
+                            // user types referenced in method signatures.
                             fory.register::<#path>(
                                 ::tarpc::serde_transport::fory_envelope::fory_wire_id(
                                     ::std::any::type_name::<#path>()

@@ -32,6 +32,29 @@
 //! minimum register the envelope wrapper types from
 //! [`crate::serde_transport::fory_envelope`] **plus** your own `Req`/`Resp` types
 //! (unless they are built-in primitive types that fory handles natively).
+//!
+//! # Codec paths
+//!
+//! Two codec paths are available:
+//!
+//! - **Classic** (`connect`/`listen`/`connect_with_fory`/`listen_with_fory`) — uses
+//!   `tokio-serde`'s `Serializer`/`Deserializer` traits. Integrates with tarpc's
+//!   `BaseChannel` / `Channel` machinery directly. All message data passes through
+//!   fory serialization. Use this when your messages are small or when you need
+//!   `BaseChannel` integration.
+//!
+//! - **Zero-copy** (`connect_zerocopy`/`listen_zerocopy`) — uses a custom `tokio-util`
+//!   `Codec` that extracts bulk body payloads as `bytes::Bytes` slices from the
+//!   receive buffer without memcpy. Returns `(envelope, Option<Bytes>)` tuples.
+//!   Use this when your service transports large payloads (e.g. 4 MiB shard data)
+//!   and receive-side allocation matters.
+//!
+//! Both paths use the same fory wire format for the envelope. The zero-copy path
+//! adds a `[body][body_len: u32 LE]` suffix after the fory-encoded envelope.
+//!
+//! TLS variants are available for both paths (`connect_tls`/`connect_zerocopy_tls`).
+//! Note: TLS decryption breaks the zero-copy aliasing property on the receive side
+//! because rustls decrypts into its own buffer.
 
 use super::fory_envelope::{ForyClientMessage, ForyResponse};
 use crate::{ClientMessage, Response};
@@ -233,7 +256,7 @@ mod tls {
     {
         let mut fory_inst = fory::Fory::default();
         S::register(&mut fory_inst)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         connect_tls_with_fory::<A, S::Req, S::Resp>(
             addr,
             Arc::new(fory_inst),
@@ -303,7 +326,7 @@ mod tls {
     {
         let mut fory_inst = fory::Fory::default();
         S::register(&mut fory_inst)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         listen_tls_with_fory::<A, S::Req, S::Resp>(addr, Arc::new(fory_inst), tls_config).await
     }
 
@@ -465,7 +488,7 @@ mod tcp {
         Response<S::Resp>: for<'de> serde::Deserialize<'de>,
     {
         let mut fory_inst = fory::Fory::default();
-        S::register(&mut fory_inst).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        S::register(&mut fory_inst).map_err(|e| io::Error::other(e.to_string()))?;
         let fory_arc = Arc::new(fory_inst);
         connect_with_fory::<A, S::Req, S::Resp>(addr, fory_arc).await
     }
@@ -481,7 +504,7 @@ mod tcp {
         A: ToSocketAddrs,
     {
         let mut fory_inst = fory::Fory::default();
-        S::register(&mut fory_inst).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        S::register(&mut fory_inst).map_err(|e| io::Error::other(e.to_string()))?;
         let fory_arc = Arc::new(fory_inst);
         listen_with_fory::<A, S::Req, S::Resp>(addr, fory_arc).await
     }

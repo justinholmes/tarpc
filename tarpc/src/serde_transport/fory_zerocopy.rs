@@ -278,6 +278,12 @@ fn encode_frame(
 ) -> Result<(), io::Error> {
     let body_len = body.as_ref().map(|b| b.len()).unwrap_or(0) as u32;
     let total = envelope.len() + body_len as usize + 4;
+    if total > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frame size {} exceeds MAX_FRAME_LEN {}", total, MAX_FRAME_LEN),
+        ));
+    }
     let mut payload = BytesMut::with_capacity(total);
     payload.extend_from_slice(&envelope);
     if let Some(b) = body {
@@ -286,7 +292,7 @@ fn encode_frame(
     payload.extend_from_slice(&body_len.to_le_bytes());
     inner
         .encode(payload.freeze(), dst)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +519,14 @@ where
     fn start_send(mut self: Pin<&mut Self>, item: Item) -> io::Result<()> {
         let fory = self.fory.clone();
         let (envelope, body) = item.to_frame(&fory)?;
+        let body_len = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let inner_total = envelope.len() + body_len + 4;
+        if inner_total > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("frame size {} exceeds MAX_FRAME_LEN {}", inner_total, MAX_FRAME_LEN),
+            ));
+        }
         self.pending = Some(PendingWrite::new(envelope, body));
         Ok(())
     }

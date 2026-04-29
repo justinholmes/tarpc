@@ -411,6 +411,10 @@ where
 /// IDs 2–9 are reserved for tarpc envelope types, so setting the high bit is safe.
 ///
 /// This is a pure `const fn` — zero runtime cost.
+///
+/// Collision probability follows the birthday paradox: ~50% at ~46,340 distinct
+/// type names (2^31 ID space with high bit set). For typical services with tens
+/// of types, collision risk is negligible.
 pub const fn fory_wire_id(name: &str) -> u32 {
     const FNV_PRIME: u32 = 16777619;
     const FNV_OFFSET: u32 = 2166136261;
@@ -470,13 +474,10 @@ impl From<trace::SamplingDecision> for u8 {
     }
 }
 
-impl From<u8> for trace::SamplingDecision {
-    fn from(v: u8) -> trace::SamplingDecision {
-        if v == 1 {
-            trace::SamplingDecision::Sampled
-        } else {
-            trace::SamplingDecision::Unsampled
-        }
+fn sampling_from_u8(v: u8) -> trace::SamplingDecision {
+    match v {
+        1 => trace::SamplingDecision::Sampled,
+        _ => trace::SamplingDecision::Unsampled,
     }
 }
 
@@ -495,7 +496,7 @@ impl From<ForyTraceContext> for trace::Context {
         trace::Context {
             trace_id: trace::TraceId::from(ftc.trace_id),
             span_id: trace::SpanId::from(ftc.span_id),
-            sampling_decision: trace::SamplingDecision::from(ftc.sampling),
+            sampling_decision: sampling_from_u8(ftc.sampling),
         }
     }
 }
