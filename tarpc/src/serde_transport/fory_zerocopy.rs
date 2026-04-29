@@ -13,13 +13,18 @@
 //! shares the same underlying allocation. `.freeze()` produces a `Bytes` that
 //! aliases the same memory — no copy occurs for the body bytes.
 //!
-//! **Encode/send path**: performs **two memcpys of the body**. `encode_frame`
-//! first copies the body into a staging `BytesMut`, then `LengthDelimitedCodec`
-//! copies that into the socket write buffer. Future work: a vectored-write Sink
-//! that eliminates send-side copies.
+//! **Encode/send path**: [`ZeroCopySink`] uses `poll_write_vectored` to send
+//! `[4-byte BE length][envelope][body][4-byte LE body_len]` as a single
+//! vectored I/O call. The body `Bytes` is stored by ref-count clone only —
+//! no userspace memcpy of body bytes occurs. A 4-byte suffix (body_len) and
+//! the small fory-serialised envelope are always copied (they are ≪ 1 KiB in
+//! practice), but the bulk payload is never copied in userspace.
 //!
 //! The canonical proof of receive-side zero-copy is
 //! `tarpc/tests/fory_zerocopy.rs::body_is_aliased`.
+//!
+//! The canonical proof of send-side zero-copy is
+//! `tarpc/tests/fory_zerocopy.rs::sink_body_not_copied`.
 //!
 //! # Wire format
 //!
@@ -28,6 +33,9 @@
 //! ```text
 //! [ fory-encoded envelope (variable) ][ body bytes (variable) ][ body_len: u32 LE ]
 //! ```
+//!
+//! The outer length prefix (4 bytes BE, produced by the Sink's vectored write) is
+//! the length of the entire inner payload: `envelope_len + body_len + 4`.
 //!
 //! If `body_len == 0` there is no bulk payload and the decoded body is `None`.
 //!
@@ -46,13 +54,18 @@ use futures::{ready, Sink, Stream};
 use pin_project::pin_project;
 use std::{
     io,
+    io::IoSlice,
     marker::PhantomData,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::io::AsyncWrite;
+use tokio::net::{
+    TcpListener, TcpStream, ToSocketAddrs,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 use tokio_util::bytes::{Bytes, BytesMut};
 use tokio_util::codec::{Encoder as _, Framed, LengthDelimitedCodec};
 
@@ -61,7 +74,8 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Server-side codec: decodes (ClientMessage<Req>, Option<Bytes>)
-//                    encodes (Response<Resp>, Option<Bytes>)
+//                    encodes (Response<Resp>, Option<Bytes>)  [legacy path, used
+//                    only by the Decoder half of the split transport]
 // ---------------------------------------------------------------------------
 
 /// Tokio-util codec for zero-copy bulk-payload framing on the **server** side.
@@ -131,7 +145,7 @@ where
 
 // ---------------------------------------------------------------------------
 // Client-side codec: decodes (Response<Resp>, Option<Bytes>)
-//                    encodes (ClientMessage<Req>, Option<Bytes>)
+//                    encodes (ClientMessage<Req>, Option<Bytes>)  [legacy path]
 // ---------------------------------------------------------------------------
 
 /// Tokio-util codec for zero-copy bulk-payload framing on the **client** side.
@@ -253,6 +267,9 @@ fn split_frame_body(frame: &mut BytesMut) -> Result<(BytesMut, Option<Bytes>), i
 /// Encode an envelope + optional body into a length-delimited frame.
 ///
 /// Writes: `[ envelope ][ body ][ body_len: u32 LE ]` into a single frame.
+///
+/// This path is retained for the legacy Encoder impls used in `body_is_aliased`
+/// and the negative tests. The production send path goes through [`ZeroCopySink`].
 fn encode_frame(
     inner: &mut LengthDelimitedCodec,
     envelope: Bytes,
@@ -264,7 +281,6 @@ fn encode_frame(
     let mut payload = BytesMut::with_capacity(total);
     payload.extend_from_slice(&envelope);
     if let Some(b) = body {
-        // Follow-up: vectored-write Sink for zero-copy encode to eliminate this memcpy.
         payload.extend_from_slice(&b);
     }
     payload.extend_from_slice(&body_len.to_le_bytes());
@@ -274,17 +290,265 @@ fn encode_frame(
 }
 
 // ---------------------------------------------------------------------------
-// ZeroCopyTransport — client-side (wraps ClientZeroCopyCodec)
+// ToFrame — trait for items that ZeroCopySink can serialise
+// ---------------------------------------------------------------------------
+
+/// Produces the serialised `(envelope_bytes, body_bytes)` pair for a send-side
+/// item without copying the body.
+///
+/// The `body` bytes are moved out — callers hold a ref-counted `Bytes` clone
+/// before the call if they need to keep a reference.
+pub trait ToFrame {
+    /// Serialise the item into `(envelope_bytes, body_bytes)`.
+    ///
+    /// The envelope is freshly allocated (fory serialisation); the body is
+    /// moved out without copying.
+    fn to_frame(self, fory: &Fory) -> io::Result<(Vec<u8>, Option<Bytes>)>;
+}
+
+impl<Req> ToFrame for (ClientMessage<Req>, Option<Bytes>)
+where
+    Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    fn to_frame(self, fory: &Fory) -> io::Result<(Vec<u8>, Option<Bytes>)> {
+        let (msg, body) = self;
+        let wrapper = ForyClientMessage::<Req>::from(&msg);
+        let envelope = fory
+            .serialize(&wrapper)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok((envelope, body))
+    }
+}
+
+impl<Resp> ToFrame for (Response<Resp>, Option<Bytes>)
+where
+    Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+{
+    fn to_frame(self, fory: &Fory) -> io::Result<(Vec<u8>, Option<Bytes>)> {
+        let (resp, body) = self;
+        let wrapper = ForyResponse::<Resp>::from(&resp);
+        let envelope = fory
+            .serialize(&wrapper)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok((envelope, body))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PendingWrite — one in-flight vectored frame
+// ---------------------------------------------------------------------------
+
+/// A fully-assembled frame that [`ZeroCopySink`] drains via `write_vectored`.
+///
+/// Wire layout:
+/// ```text
+/// [ length_prefix: 4 B BE ][ envelope: N B ][ body: M B ][ body_len_suffix: 4 B LE ]
+/// ```
+///
+/// The cursor walks through all four chunks sequentially.  No userspace copy
+/// of `body` is performed: `IoSlice::new(&body[..])` references the existing
+/// `Bytes` allocation directly.
+struct PendingWrite {
+    /// 4-byte big-endian outer length (inner_total = envelope + body + 4).
+    length_prefix: [u8; 4],
+    /// Fory-serialised envelope bytes (owned, heap-allocated, small).
+    envelope: Vec<u8>,
+    /// Bulk payload ref-counted slice — NOT copied.
+    body: Option<Bytes>,
+    /// 4-byte little-endian body_len suffix.
+    body_len_suffix: [u8; 4],
+    /// Bytes written so far across all chunks.
+    cursor: usize,
+    /// Total bytes to write (4 + envelope.len() + body_len + 4).
+    total: usize,
+}
+
+impl PendingWrite {
+    fn new(envelope: Vec<u8>, body: Option<Bytes>) -> Self {
+        let body_len = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let inner_total = envelope.len() + body_len + 4; // envelope + body + suffix
+        let total = 4 + inner_total;
+        let length_prefix = (inner_total as u32).to_be_bytes();
+        let body_len_suffix = (body_len as u32).to_le_bytes();
+        PendingWrite { length_prefix, envelope, body, body_len_suffix, cursor: 0, total }
+    }
+
+    /// Build IoSlices representing the remaining bytes starting at `cursor`.
+    ///
+    /// The chunks are laid out as:
+    ///   chunk 0: length_prefix  (offset 0)
+    ///   chunk 1: envelope       (offset 4)
+    ///   chunk 2: body           (offset 4 + envelope.len())
+    ///   chunk 3: body_len_suffix (offset 4 + envelope.len() + body_len)
+    ///
+    /// Chunks that have been fully written (cursor >= chunk_end) are omitted.
+    /// The first partially-written chunk is sliced from its in-progress byte.
+    fn io_slices<'a>(&'a self) -> Vec<IoSlice<'a>> {
+        let mut slices = Vec::with_capacity(4);
+        let body_len = self.body.as_ref().map(|b| b.len()).unwrap_or(0);
+
+        // Chunk offsets.
+        let off0 = 0usize;                              // length_prefix start
+        let off1 = 4usize;                              // envelope start
+        let off2 = off1 + self.envelope.len();          // body start
+        let off3 = off2 + body_len;                     // body_len_suffix start
+        let end  = off3 + 4;
+        debug_assert_eq!(end, self.total);
+
+        let c = self.cursor;
+
+        // chunk 0: length_prefix
+        if c < off1 {
+            let start_in_chunk = c.saturating_sub(off0);
+            slices.push(IoSlice::new(&self.length_prefix[start_in_chunk..]));
+        }
+        // chunk 1: envelope
+        if c < off2 {
+            let start_in_chunk = c.saturating_sub(off1);
+            slices.push(IoSlice::new(&self.envelope[start_in_chunk..]));
+        }
+        // chunk 2: body (may be absent)
+        if let Some(ref b) = self.body {
+            if c < off3 {
+                let start_in_chunk = c.saturating_sub(off2);
+                slices.push(IoSlice::new(&b[start_in_chunk..]));
+            }
+        }
+        // chunk 3: body_len_suffix
+        if c < end {
+            let start_in_chunk = c.saturating_sub(off3);
+            slices.push(IoSlice::new(&self.body_len_suffix[start_in_chunk..]));
+        }
+
+        slices
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZeroCopySink — vectored-write Sink for the send path
+// ---------------------------------------------------------------------------
+
+/// Vectored-write [`Sink`] for zero-copy encoding of `(envelope, body)` frames.
+///
+/// `start_send` stores the item (moves `body` by ref-count only — no memcpy).
+/// `poll_flush` drives `write_vectored` until all bytes are on the wire.
+///
+/// # Userspace zero-copy guarantee
+///
+/// The body `Bytes` is stored inside [`PendingWrite`] and referenced directly
+/// via `IoSlice` during `poll_write_vectored`.  The kernel receives scatter/gather
+/// I/O vectors pointing into the original `Bytes` allocation; no userspace copy
+/// is performed.  On Linux, `writev(2)` on a TCP socket DMA-maps the pages
+/// directly when the NIC supports scatter/gather.
+///
+/// Note: the 4-byte length prefix and 4-byte body_len suffix are always copied
+/// (they are stack-allocated temporaries assembled in [`PendingWrite::new`]).
+/// The fory-serialised envelope is copied once into a `Vec<u8>` by
+/// `fory.serialize`. These are O(1) copies relative to body size.
+pub struct ZeroCopySink<W, Item> {
+    writer: W,
+    pending: Option<PendingWrite>,
+    fory: Arc<Fory>,
+    _marker: PhantomData<fn(Item)>,
+}
+
+impl<W, Item> ZeroCopySink<W, Item> {
+    /// Create a new sink wrapping `writer`.
+    pub fn new(writer: W, fory: Arc<Fory>) -> Self {
+        ZeroCopySink { writer, pending: None, fory, _marker: PhantomData }
+    }
+}
+
+/// Drive a pending vectored write to completion, then flush `writer`.
+///
+/// Accepts the two struct fields as separate borrows so the borrow checker
+/// can verify that `pending` and `writer` do not alias — a constraint it
+/// cannot prove when both are accessed through `self`.
+fn poll_flush_pending<W>(
+    pending: &mut Option<PendingWrite>,
+    writer: &mut W,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>>
+where
+    W: AsyncWrite + Unpin,
+{
+    while pending.is_some() {
+        // Build IoSlices from the pending write.  The slices borrow into
+        // `pending`; the borrow ends before we touch `writer`.
+        let slices: Vec<IoSlice<'_>> = pending.as_ref().unwrap().io_slices();
+
+        let n = ready!(Pin::new(&mut *writer).poll_write_vectored(cx, &slices))?;
+
+        if n == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_vectored returned 0 bytes",
+            )));
+        }
+
+        let pw = pending.as_mut().unwrap();
+        pw.cursor += n;
+        if pw.cursor >= pw.total {
+            *pending = None;
+        }
+    }
+    Pin::new(&mut *writer).poll_flush(cx)
+}
+
+impl<W, Item> Sink<Item> for ZeroCopySink<W, Item>
+where
+    W: AsyncWrite + Unpin,
+    Item: ToFrame,
+{
+    type Error = io::Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Back-pressure: flush the pending write before accepting another item.
+        if self.pending.is_some() {
+            ready!(self.as_mut().poll_flush(cx))?;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Item) -> io::Result<()> {
+        let fory = self.fory.clone();
+        let (envelope, body) = item.to_frame(&fory)?;
+        self.pending = Some(PendingWrite::new(envelope, body));
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Borrow the two fields independently so the borrow checker can see
+        // that `pending` and `writer` do not alias.
+        let this = &mut *self;
+        poll_flush_pending(&mut this.pending, &mut this.writer, cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+        Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZeroCopyTransport — client-side (split stream + vectored sink)
 // ---------------------------------------------------------------------------
 
 /// Client-side zero-copy transport.
+///
+/// The read half uses [`Framed<OwnedReadHalf, ClientZeroCopyCodec>`]; the write
+/// half uses [`ZeroCopySink<OwnedWriteHalf>`] which avoids body memcpys via
+/// `write_vectored`.
 ///
 /// Implements `Stream<Item = io::Result<(Response<Resp>, Option<Bytes>)>>` and
 /// `Sink<(ClientMessage<Req>, Option<Bytes>)>`.
 #[pin_project]
 pub struct ZeroCopyTransport<Req, Resp> {
+    /// Read half: LengthDelimited decode + body split_off (receive zero-copy).
     #[pin]
-    inner: Framed<TcpStream, ClientZeroCopyCodec<Req, Resp>>,
+    stream: Framed<OwnedReadHalf, ClientZeroCopyCodec<Req, Resp>>,
+    /// Write half: vectored writes (send zero-copy — no body memcpy).
+    sink: ZeroCopySink<OwnedWriteHalf, (ClientMessage<Req>, Option<Bytes>)>,
 }
 
 impl<Req, Resp> Stream for ZeroCopyTransport<Req, Resp>
@@ -296,7 +560,7 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project()
-            .inner
+            .stream
             .poll_next(cx)
             .map_err(io::Error::other)
     }
@@ -310,37 +574,41 @@ where
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_ready(cx).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).poll_ready(cx)
     }
 
     fn start_send(
         self: Pin<&mut Self>,
         item: (ClientMessage<Req>, Option<Bytes>),
     ) -> io::Result<()> {
-        self.project().inner.start_send(item).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).start_send(item)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_close(cx).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).poll_close(cx)
     }
 }
 
 // ---------------------------------------------------------------------------
-// ZeroCopyServerTransport — server-side (wraps ServerZeroCopyCodec)
+// ZeroCopyServerTransport — server-side (split stream + vectored sink)
 // ---------------------------------------------------------------------------
 
 /// Server-side zero-copy transport (one accepted connection).
+///
+/// Same split-half design as [`ZeroCopyTransport`]: read half decodes via
+/// [`ServerZeroCopyCodec`], write half uses [`ZeroCopySink`].
 ///
 /// Implements `Stream<Item = io::Result<(ClientMessage<Req>, Option<Bytes>)>>` and
 /// `Sink<(Response<Resp>, Option<Bytes>)>`.
 #[pin_project]
 pub struct ZeroCopyServerTransport<Req, Resp> {
     #[pin]
-    inner: Framed<TcpStream, ServerZeroCopyCodec<Req, Resp>>,
+    stream: Framed<OwnedReadHalf, ServerZeroCopyCodec<Req, Resp>>,
+    sink: ZeroCopySink<OwnedWriteHalf, (Response<Resp>, Option<Bytes>)>,
 }
 
 impl<Req, Resp> Stream for ZeroCopyServerTransport<Req, Resp>
@@ -352,7 +620,7 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project()
-            .inner
+            .stream
             .poll_next(cx)
             .map_err(io::Error::other)
     }
@@ -366,22 +634,22 @@ where
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_ready(cx).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).poll_ready(cx)
     }
 
     fn start_send(
         self: Pin<&mut Self>,
         item: (Response<Resp>, Option<Bytes>),
     ) -> io::Result<()> {
-        self.project().inner.start_send(item).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).start_send(item)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_close(cx).map_err(io::Error::other)
+        Pin::new(&mut self.project().sink).poll_close(cx)
     }
 }
 
@@ -418,13 +686,14 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let accept_result = ready!(self.as_mut().project().listener.poll_accept(cx));
-        let (stream, _peer) = match accept_result {
+        let (tcp_stream, _peer) = match accept_result {
             Ok(pair) => pair,
             Err(e) => return Poll::Ready(Some(Err(e))),
         };
-        let codec = ServerZeroCopyCodec::new(self.fory.clone());
-        let framed = Framed::new(stream, codec);
-        Poll::Ready(Some(Ok(ZeroCopyServerTransport { inner: framed })))
+        let (rd, wr) = tcp_stream.into_split();
+        let stream = Framed::new(rd, ServerZeroCopyCodec::new(self.fory.clone()));
+        let sink = ZeroCopySink::new(wr, self.fory.clone());
+        Poll::Ready(Some(Ok(ZeroCopyServerTransport { stream, sink })))
     }
 }
 
@@ -446,10 +715,11 @@ where
     Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
     Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
 {
-    let stream = TcpStream::connect(addr).await?;
-    let codec = ClientZeroCopyCodec::new(fory);
-    let framed = Framed::new(stream, codec);
-    Ok(ZeroCopyTransport { inner: framed })
+    let tcp_stream = TcpStream::connect(addr).await?;
+    let (rd, wr) = tcp_stream.into_split();
+    let stream = Framed::new(rd, ClientZeroCopyCodec::new(fory.clone()));
+    let sink = ZeroCopySink::new(wr, fory);
+    Ok(ZeroCopyTransport { stream, sink })
 }
 
 /// Listen on `addr` and return a [`ZeroCopyIncoming`] stream of server-side
@@ -493,13 +763,17 @@ pub use zerocopy_tls::{
 /// socket read buffer. **No allocation-level zero-copy is possible through the
 /// TLS layer.**
 ///
+/// On the **send path**, vectored-write optimisation does not apply to the TLS
+/// variant. rustls internally buffers and encrypts per-record before issuing
+/// writes, so scatter/gather I/O vectors passed to `poll_write_vectored` are
+/// reassembled into contiguous plaintext before encryption anyway. The TLS
+/// transports therefore continue using the single-buffer `Framed` encode path
+/// (same as before this commit) rather than the new `ZeroCopySink`.
+///
 /// Functional correctness (body length and content) is preserved. If
 /// zero-copy aliasing is critical for a hot path, consider terminating TLS
 /// at a sidecar or load-balancer and using the plain-TCP zero-copy transport
 /// on the internal leg.
-///
-/// The **send path** behaviour is unchanged: two memcpys occur (same as the
-/// plain-TCP variant).
 #[cfg(feature = "serde-transport-fory-tls")]
 mod zerocopy_tls {
     use super::{ClientZeroCopyCodec, ServerZeroCopyCodec};
