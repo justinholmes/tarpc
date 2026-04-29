@@ -69,6 +69,7 @@ opentelemetry = { version = "0.31", default-features = false }
 opentelemetry-semantic-conventions = "0.31"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 fory-core = "0.17"
 anyhow = "1.0"
 assert_matches = "1.5"
@@ -148,4 +149,9 @@ required-features = ["serde-transport-fory-tls", "tcp"]
 
 [[test]]
 name = "fory_zerocopy"
+required-features = ["serde-transport-fory", "tcp"]
+
+[[bench]]
+name = "fory_codec_compare"
+harness = false
 required-features = ["serde-transport-fory", "tcp"]
