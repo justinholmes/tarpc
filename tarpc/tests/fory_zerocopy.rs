@@ -82,12 +82,13 @@ async fn body_is_aliased() {
         .encode((req, Some(body.clone())), &mut wire_buf)
         .expect("encode failed");
 
-    // Record the start of the wire buffer allocation before the server
-    // decoder splits it.  After LengthDelimitedCodec pulls out the frame,
-    // the frame BytesMut shares the same backing store as wire_buf (because
-    // LengthDelimitedCodec does split_to under the hood).
+    // Record the bounds of the wire buffer before the server decoder splits it.
+    // After LengthDelimitedCodec pulls out the frame, the frame BytesMut shares
+    // the same backing store as wire_buf (LengthDelimitedCodec uses split_to
+    // internally). The body Bytes produced by split_off + freeze() must lie
+    // entirely within [wire_start, wire_end) — no slack.
     let wire_start = wire_buf.as_ptr() as usize;
-    let wire_end = wire_start + wire_buf.capacity();
+    let wire_end = wire_buf.as_ptr() as usize + wire_buf.len();
 
     // Decode using server-side codec.
     let mut server_codec = ServerZeroCopyCodec::<String, String>::new(fory.clone());
@@ -121,8 +122,7 @@ async fn body_is_aliased() {
     //    original allocation.
     let body_ptr = received_body.as_ptr() as usize;
     assert!(
-        body_ptr >= wire_start && body_ptr + received_body.len() <= wire_end + 8,
-        // +8 for the length-prefix bytes that may shift the window slightly.
+        body_ptr >= wire_start && body_ptr + received_body.len() <= wire_end,
         "body pointer 0x{:x} is NOT within frame allocation [0x{:x}, 0x{:x}) — a copy occurred",
         body_ptr,
         wire_start,
@@ -290,4 +290,101 @@ async fn concurrent_4mib_bodies() {
         seen.insert(resp.request_id, true);
     }
     assert_eq!(seen.len(), 100, "did not receive all 100 responses");
+}
+
+// ---------------------------------------------------------------------------
+// Negative tests — malformed frames must be rejected with InvalidData,
+// not panic or silently succeed.
+// ---------------------------------------------------------------------------
+
+/// A frame shorter than 4 bytes cannot contain the body_len suffix.
+/// The codec must return InvalidData rather than panic.
+#[test]
+fn rejects_short_frame() {
+    use tarpc::serde_transport::fory_zerocopy::ServerZeroCopyCodec;
+    use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
+
+    let fory = make_fory();
+    let mut codec = ServerZeroCopyCodec::<String, String>::new(fory);
+
+    // Build a length-delimited frame whose inner payload is only 2 bytes —
+    // shorter than the 4-byte body_len suffix the codec requires.
+    let inner = bytes::Bytes::from_static(&[0x01, 0x02]);
+    let mut ld = LengthDelimitedCodec::new();
+    let mut buf = bytes::BytesMut::new();
+    ld.encode(inner, &mut buf).expect("ld encode failed");
+
+    let result = codec.decode(&mut buf);
+    match result {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData,
+            "expected InvalidData, got {:?}",
+            e
+        ),
+        Ok(v) => panic!("expected Err(InvalidData), got Ok({:?})", v),
+    }
+}
+
+/// A frame whose body_len suffix claims a size larger than the remaining
+/// frame bytes must be rejected with InvalidData, not wrap-around or panic.
+#[test]
+fn rejects_oversized_body_len() {
+    use tarpc::serde_transport::fory_zerocopy::ServerZeroCopyCodec;
+    use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
+
+    let fory = make_fory();
+    let mut codec = ServerZeroCopyCodec::<String, String>::new(fory);
+
+    // Frame inner: 16 bytes of zeros (fake envelope) + u32::MAX as body_len suffix.
+    let mut frame_inner = vec![0u8; 16];
+    frame_inner.extend_from_slice(&u32::MAX.to_le_bytes());
+
+    let mut ld = LengthDelimitedCodec::new();
+    let mut buf = bytes::BytesMut::new();
+    ld.encode(bytes::Bytes::from(frame_inner), &mut buf)
+        .expect("ld encode failed");
+
+    let result = codec.decode(&mut buf);
+    match result {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData,
+            "expected InvalidData, got {:?}",
+            e
+        ),
+        Ok(v) => panic!("expected Err(InvalidData), got Ok({:?})", v),
+    }
+}
+
+/// When body_len = 0 the envelope region is the entire frame minus the 4-byte
+/// suffix.  Any trailing bytes between the envelope and the suffix are part of
+/// the bytes passed to fory::deserialize.  Because fory does not expose how
+/// many bytes it consumed, intra-envelope padding is undetectable at the codec
+/// layer; the wire-format contract (documented in the module doc) requires
+/// senders to never include such padding.  This test verifies that a well-formed
+/// frame with body_len = 0 round-trips correctly (the codec does not mistakenly
+/// reject it).
+#[test]
+fn zero_body_len_roundtrip() {
+    use tarpc::serde_transport::fory_zerocopy::{ClientZeroCopyCodec, ServerZeroCopyCodec};
+    use tokio_util::codec::{Decoder, Encoder};
+
+    let fory = make_fory();
+    let req = make_request(99, "no-body-negative");
+
+    let mut client_codec = ClientZeroCopyCodec::<String, String>::new(fory.clone());
+    let mut wire_buf = bytes::BytesMut::new();
+    client_codec
+        .encode((req, None), &mut wire_buf)
+        .expect("encode failed");
+
+    let mut server_codec = ServerZeroCopyCodec::<String, String>::new(fory);
+    let decoded = server_codec
+        .decode(&mut wire_buf)
+        .expect("decode returned Err")
+        .expect("decode returned None");
+
+    let (_msg, body) = decoded;
+    assert!(body.is_none(), "expected no body for body_len = 0 frame");
 }

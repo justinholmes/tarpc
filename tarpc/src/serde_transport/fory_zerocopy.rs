@@ -5,6 +5,22 @@
 //! `tokio_util::codec` layer — bypassing tokio-serde — so that large body
 //! payloads can be sliced out of the incoming frame buffer without copying.
 //!
+//! # Zero-copy scope
+//!
+//! **Decode/receive path**: true zero-copy. [`tokio_util::codec::Decoder::decode`]
+//! receives a `&mut BytesMut`; after the length-delimited inner codec extracts a
+//! frame, `split_off` is used to obtain the body region as a new `BytesMut` that
+//! shares the same underlying allocation. `.freeze()` produces a `Bytes` that
+//! aliases the same memory — no copy occurs for the body bytes.
+//!
+//! **Encode/send path**: performs **two memcpys of the body**. `encode_frame`
+//! first copies the body into a staging `BytesMut`, then `LengthDelimitedCodec`
+//! copies that into the socket write buffer. Future work: a vectored-write Sink
+//! that eliminates send-side copies.
+//!
+//! The canonical proof of receive-side zero-copy is
+//! `tarpc/tests/fory_zerocopy.rs::body_is_aliased`.
+//!
 //! # Wire format
 //!
 //! Each length-delimited frame contains:
@@ -15,15 +31,13 @@
 //!
 //! If `body_len == 0` there is no bulk payload and the decoded body is `None`.
 //!
-//! # Zero-copy proof
+//! # Wire-format constraint
 //!
-//! On the decode path, [`tokio_util::codec::Decoder::decode`] receives a
-//! `&mut BytesMut`.  After the length-delimited inner codec extracts a frame,
-//! `split_off` is used to obtain the body region as a new `BytesMut` that
-//! shares the same underlying allocation.  `.freeze()` produces a `Bytes` that
-//! aliases the same memory — no copy occurs for the body bytes.
-//!
-//! The canonical proof is `tarpc/tests/fory_zerocopy.rs::body_is_aliased`.
+//! Senders MUST NOT include trailing padding bytes within the envelope region
+//! (i.e. between the end of the fory-serialized envelope and the start of the
+//! body). Fory's deserialize API does not expose how many bytes were consumed,
+//! so the codec cannot detect intra-envelope padding; such bytes would be
+//! silently incorporated into the deserialized envelope and may cause corruption.
 
 use super::fory_envelope::{ForyClientMessage, ForyResponse};
 use crate::{ClientMessage, Response};
@@ -250,6 +264,7 @@ fn encode_frame(
     let mut payload = BytesMut::with_capacity(total);
     payload.extend_from_slice(&envelope);
     if let Some(b) = body {
+        // Follow-up: vectored-write Sink for zero-copy encode to eliminate this memcpy.
         payload.extend_from_slice(&b);
     }
     payload.extend_from_slice(&body_len.to_le_bytes());
