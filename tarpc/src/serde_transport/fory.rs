@@ -42,6 +42,10 @@ use tokio_util::bytes::{Bytes, BytesMut};
 // The parent module (serde_transport) exposes `new` and `Transport`.
 use crate::serde_transport::{self, Transport};
 
+/// Maximum frame size for fory-encoded messages (64 MiB).
+/// Matches cloudverve fabric's existing cap (`fabric/transport.rs:143`).
+const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // ForyEnvelopeCodec
 // ---------------------------------------------------------------------------
@@ -196,7 +200,7 @@ mod tls {
     use tokio_rustls::server::TlsStream as ServerTlsStream;
     use tokio_util::codec::length_delimited;
 
-    const MAX_FRAME_LEN: usize = 64 * 1024 * 1024; // 64 MiB — matches cloudverve fabric framing
+    use super::MAX_FRAME_LEN;
 
     // -----------------------------------------------------------------------
     // connect_tls (schema-driven)
@@ -507,7 +511,7 @@ mod tcp {
     {
         let stream = TcpStream::connect(addr).await?;
         let framed = length_delimited::Builder::new()
-            .max_frame_length(usize::MAX / 2)
+            .max_frame_length(MAX_FRAME_LEN)
             .new_framed(stream);
         Ok(serde_transport::new(framed, ForyEnvelopeCodec::new(fory)))
     }
@@ -564,7 +568,7 @@ mod tcp {
             listener,
             fory,
             local_addr,
-            config: *length_delimited::Builder::new().max_frame_length(usize::MAX / 2),
+            config: *length_delimited::Builder::new().max_frame_length(MAX_FRAME_LEN),
             _marker: PhantomData,
         })
     }
