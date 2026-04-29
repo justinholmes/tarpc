@@ -470,3 +470,319 @@ where
     let local_addr = listener.local_addr()?;
     Ok(ZeroCopyIncoming { listener, fory, local_addr, _marker: PhantomData })
 }
+
+// ---------------------------------------------------------------------------
+// TLS variant — requires `serde-transport-fory-tls` + `tcp` features
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "serde-transport-fory-tls")]
+pub use zerocopy_tls::{
+    ZeroCopyTlsIncoming, ZeroCopyTlsTransport, ZeroCopyTlsServerTransport,
+    connect_zerocopy_tls, listen_zerocopy_tls,
+};
+
+/// TLS-enabled zero-copy transports.
+///
+/// # Zero-copy and TLS
+///
+/// On the **receive path**, TLS breaks the body-aliasing property that holds
+/// for the plain-TCP variant. rustls decrypts each TLS record into its own
+/// internal buffer and then copies the plaintext into the application-supplied
+/// buffer. As a result the `Bytes` returned for the body region is allocated
+/// from rustls's internal plaintext buffer rather than aliasing the original
+/// socket read buffer. **No allocation-level zero-copy is possible through the
+/// TLS layer.**
+///
+/// Functional correctness (body length and content) is preserved. If
+/// zero-copy aliasing is critical for a hot path, consider terminating TLS
+/// at a sidecar or load-balancer and using the plain-TCP zero-copy transport
+/// on the internal leg.
+///
+/// The **send path** behaviour is unchanged: two memcpys occur (same as the
+/// plain-TCP variant).
+#[cfg(feature = "serde-transport-fory-tls")]
+mod zerocopy_tls {
+    use super::{ClientZeroCopyCodec, ServerZeroCopyCodec};
+    use crate::{ClientMessage, Response};
+    use fory::Fory;
+    use futures::{Sink, Stream};
+    use pin_project::pin_project;
+    use std::{
+        io,
+        marker::PhantomData,
+        net::SocketAddr,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+    use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+    use tokio::sync::{mpsc, watch};
+    use tokio_rustls::rustls::{ClientConfig, ServerConfig, pki_types::ServerName};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use tokio_rustls::client::TlsStream as ClientTlsStream;
+    use tokio_rustls::server::TlsStream as ServerTlsStream;
+    use tokio_util::bytes::Bytes;
+    use tokio_util::codec::Framed;
+
+    // -----------------------------------------------------------------------
+    // ZeroCopyTlsTransport — client-side
+    // -----------------------------------------------------------------------
+
+    /// Client-side TLS zero-copy transport.
+    ///
+    /// Implements `Stream<Item = io::Result<(Response<Resp>, Option<Bytes>)>>`
+    /// and `Sink<(ClientMessage<Req>, Option<Bytes>)>`.
+    ///
+    /// See the [module-level docs](super::zerocopy_tls) for the note on
+    /// zero-copy behaviour through the TLS layer.
+    #[pin_project]
+    pub struct ZeroCopyTlsTransport<Req, Resp> {
+        #[pin]
+        inner: Framed<ClientTlsStream<TcpStream>, ClientZeroCopyCodec<Req, Resp>>,
+    }
+
+    impl<Req, Resp> Stream for ZeroCopyTlsTransport<Req, Resp>
+    where
+        Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+    {
+        type Item = io::Result<(Response<Resp>, Option<Bytes>)>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.project().inner.poll_next(cx).map_err(io::Error::other)
+        }
+    }
+
+    impl<Req, Resp> Sink<(ClientMessage<Req>, Option<Bytes>)> for ZeroCopyTlsTransport<Req, Resp>
+    where
+        Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+    {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.project().inner.poll_ready(cx).map_err(io::Error::other)
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: (ClientMessage<Req>, Option<Bytes>),
+        ) -> io::Result<()> {
+            self.project().inner.start_send(item).map_err(io::Error::other)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.project().inner.poll_flush(cx).map_err(io::Error::other)
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.project().inner.poll_close(cx).map_err(io::Error::other)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ZeroCopyTlsServerTransport — server-side (one accepted connection)
+    // -----------------------------------------------------------------------
+
+    /// Server-side TLS zero-copy transport (one accepted connection).
+    ///
+    /// Implements `Stream<Item = io::Result<(ClientMessage<Req>, Option<Bytes>)>>`
+    /// and `Sink<(Response<Resp>, Option<Bytes>)>`.
+    #[pin_project]
+    pub struct ZeroCopyTlsServerTransport<Req, Resp> {
+        #[pin]
+        inner: Framed<ServerTlsStream<TcpStream>, ServerZeroCopyCodec<Req, Resp>>,
+    }
+
+    impl<Req, Resp> Stream for ZeroCopyTlsServerTransport<Req, Resp>
+    where
+        Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    {
+        type Item = io::Result<(ClientMessage<Req>, Option<Bytes>)>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.project().inner.poll_next(cx).map_err(io::Error::other)
+        }
+    }
+
+    impl<Req, Resp> Sink<(Response<Resp>, Option<Bytes>)> for ZeroCopyTlsServerTransport<Req, Resp>
+    where
+        Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.project().inner.poll_ready(cx).map_err(io::Error::other)
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: (Response<Resp>, Option<Bytes>),
+        ) -> io::Result<()> {
+            self.project().inner.start_send(item).map_err(io::Error::other)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.project().inner.poll_flush(cx).map_err(io::Error::other)
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.project().inner.poll_close(cx).map_err(io::Error::other)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ZeroCopyTlsIncoming — mpsc-backed server listener
+    // -----------------------------------------------------------------------
+
+    /// Stream of TLS-wrapped server-side zero-copy transports.
+    ///
+    /// Each item is a fully-handshaked [`ZeroCopyTlsServerTransport`].
+    ///
+    /// The mpsc-backed design (same as [`crate::serde_transport::fory::tls`])
+    /// keeps `poll_next` synchronous while TLS handshakes happen concurrently
+    /// in spawned tasks: one per accepted connection, so a slow handshake
+    /// cannot stall subsequent accepts.
+    pub struct ZeroCopyTlsIncoming<Req, Resp> {
+        rx: mpsc::Receiver<io::Result<ZeroCopyTlsServerTransport<Req, Resp>>>,
+        local_addr: SocketAddr,
+        _marker: PhantomData<(Req, Resp)>,
+    }
+
+    impl<Req, Resp> ZeroCopyTlsIncoming<Req, Resp> {
+        /// Returns the local address this listener is bound to.
+        pub fn local_addr(&self) -> SocketAddr {
+            self.local_addr
+        }
+    }
+
+    impl<Req, Resp> Stream for ZeroCopyTlsIncoming<Req, Resp>
+    where
+        Req: fory::Serializer + fory::ForyDefault + Send + Unpin + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + Unpin + 'static,
+    {
+        type Item = io::Result<ZeroCopyTlsServerTransport<Req, Resp>>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.rx.poll_recv(cx)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // accept_loop — background task: listen → handshake → push to mpsc
+    // -----------------------------------------------------------------------
+
+    async fn accept_loop<Req, Resp>(
+        listener: TcpListener,
+        fory: Arc<Fory>,
+        tls_config: watch::Receiver<Arc<ServerConfig>>,
+        tx: mpsc::Sender<io::Result<ZeroCopyTlsServerTransport<Req, Resp>>>,
+    ) where
+        Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    {
+        loop {
+            let tcp_result = listener.accept().await;
+            let (stream, _peer) = match tcp_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+
+            // Snapshot ServerConfig at handshake time — cert-rotation hook.
+            // Each new TLS handshake picks up whatever ServerConfig is current
+            // in the watch channel without affecting established sessions.
+            let acceptor = TlsAcceptor::from(tls_config.borrow().clone());
+            let fory_clone = fory.clone();
+            let tx_clone = tx.clone();
+
+            // Spawn each handshake concurrently so a slow client cannot stall
+            // subsequent accepts.
+            tokio::spawn(async move {
+                let result = async {
+                    let tls_stream = acceptor.accept(stream).await?;
+                    // ServerZeroCopyCodec::new sets max_frame_length = MAX_FRAME_LEN
+                    // internally; that constant is defined at the parent module level.
+                    let codec = ServerZeroCopyCodec::<Req, Resp>::new(fory_clone);
+                    let framed = Framed::new(tls_stream, codec);
+                    io::Result::Ok(ZeroCopyTlsServerTransport { inner: framed })
+                }
+                .await;
+                let _ = tx_clone.send(result).await;
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
+    /// Connect to `addr` and return a client-side TLS zero-copy transport.
+    ///
+    /// Snapshots the current [`ClientConfig`] from `tls_config` at connect
+    /// time. Callers rotate client credentials by updating the watch channel
+    /// sender — each new `connect_zerocopy_tls` call picks up the latest config.
+    ///
+    /// The `fory` instance must have all required envelope types and the
+    /// `Req`/`Resp` types registered. Use
+    /// [`super::super::fory_envelope::register_envelope_types`] for the
+    /// envelope types.
+    pub async fn connect_zerocopy_tls<Req, Resp, A>(
+        addr: A,
+        fory: Arc<Fory>,
+        tls_config: watch::Receiver<Arc<ClientConfig>>,
+        server_name: ServerName<'static>,
+    ) -> io::Result<ZeroCopyTlsTransport<Req, Resp>>
+    where
+        A: ToSocketAddrs,
+        Req: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Send + 'static,
+    {
+        let stream = TcpStream::connect(addr).await?;
+        let connector = TlsConnector::from(tls_config.borrow().clone());
+        let tls_stream = connector.connect(server_name, stream).await?;
+        let codec = ClientZeroCopyCodec::new(fory);
+        let framed = Framed::new(tls_stream, codec);
+        Ok(ZeroCopyTlsTransport { inner: framed })
+    }
+
+    /// Listen on `addr` and return a [`ZeroCopyTlsIncoming`] stream of
+    /// server-side TLS zero-copy transports.
+    ///
+    /// The `watch::Receiver<Arc<ServerConfig>>` pattern supports cert rotation:
+    /// update the sender and all subsequent TLS handshakes use the new cert
+    /// without dropping existing connections.
+    ///
+    /// The `fory` instance must have all required envelope types and the
+    /// `Req`/`Resp` types registered.
+    pub async fn listen_zerocopy_tls<Req, Resp, A>(
+        addr: A,
+        fory: Arc<Fory>,
+        tls_config: watch::Receiver<Arc<ServerConfig>>,
+    ) -> io::Result<ZeroCopyTlsIncoming<Req, Resp>>
+    where
+        A: ToSocketAddrs,
+        Req: fory::Serializer + fory::ForyDefault + Send + 'static,
+        Resp: fory::Serializer + fory::ForyDefault + Clone + Send + 'static,
+    {
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+
+        // Design note: `Stream::poll_next` is synchronous but TLS handshakes are
+        // async. We spawn a background accept_loop (same pattern as the classic
+        // fory TLS transport) that pushes fully-handshaked transports into an
+        // mpsc channel. ZeroCopyTlsIncoming::poll_next simply drains the receiver.
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(accept_loop::<Req, Resp>(listener, fory, tls_config, tx));
+
+        Ok(ZeroCopyTlsIncoming { rx, local_addr, _marker: PhantomData })
+    }
+}

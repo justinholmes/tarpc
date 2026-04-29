@@ -151,6 +151,10 @@ required-features = ["serde-transport-fory-tls", "tcp"]
 name = "fory_zerocopy"
 required-features = ["serde-transport-fory", "tcp"]
 
+[[test]]
+name = "fory_zerocopy_tls"
+required-features = ["serde-transport-fory-tls", "tcp"]
+
 [[bench]]
 name = "fory_codec_compare"
 harness = false
